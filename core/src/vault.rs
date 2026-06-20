@@ -5,8 +5,10 @@ use archiveos_contract::{
     VaultError, VaultMetadata, ARCHIVEOS_DIR, BLOBS_DIR, DB_FILE, STAGING_DIR, VAULT_JSON,
 };
 use chrono::Utc;
+use rusqlite::Connection;
 use uuid::Uuid;
 
+use crate::db::{migrate, open_connection};
 use crate::layout::{
     blob_path as layout_blob_path, is_dir_empty, staging_job_path, validate_layout,
 };
@@ -14,6 +16,7 @@ use crate::layout::{
 pub struct Vault {
     root: PathBuf,
     metadata: VaultMetadata,
+    db: Connection,
 }
 
 impl Vault {
@@ -39,13 +42,18 @@ impl Vault {
         fs::create_dir_all(root.join(BLOBS_DIR))?;
         fs::create_dir_all(root.join(STAGING_DIR))?;
 
-        Ok(Self { root, metadata })
+        let db = open_connection(&archiveos.join(DB_FILE))?;
+        migrate(&db)?;
+
+        Ok(Self { root, metadata, db })
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self, VaultError> {
         let root = root.as_ref().to_path_buf();
         let metadata = validate_layout(&root)?;
-        Ok(Self { root, metadata })
+        let db = open_connection(&root.join(ARCHIVEOS_DIR).join(DB_FILE))?;
+        migrate(&db)?;
+        Ok(Self { root, metadata, db })
     }
 
     pub fn root(&self) -> &Path {
@@ -58,6 +66,10 @@ impl Vault {
 
     pub fn metadata(&self) -> &VaultMetadata {
         &self.metadata
+    }
+
+    pub fn connection(&self) -> &Connection {
+        &self.db
     }
 
     pub fn archiveos_dir(&self) -> PathBuf {
@@ -88,7 +100,7 @@ impl Vault {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use archiveos_contract::VaultError;
+    use archiveos_contract::{VaultError, DB_SCHEMA_VERSION};
     use tempfile::tempdir;
 
     #[test]
@@ -102,6 +114,21 @@ mod tests {
         assert!(vault_path.join("blobs").is_dir());
         assert!(vault_path.join("staging").is_dir());
         assert_eq!(vault.root(), vault_path.as_path());
+    }
+
+    #[test]
+    fn init_applies_schema() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let version: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT MAX(version) FROM schema_migrations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, DB_SCHEMA_VERSION);
     }
 
     #[test]
@@ -121,6 +148,18 @@ mod tests {
         let v1 = Vault::init(&vault_path).unwrap();
         let v2 = Vault::open(&vault_path).unwrap();
         assert_eq!(v1.id(), v2.id());
+    }
+
+    #[test]
+    fn open_runs_migrations_idempotently() {
+        let dir = tempdir().unwrap();
+        Vault::init(dir.path()).unwrap();
+        let vault = Vault::open(dir.path()).unwrap();
+        let count: i32 = vault
+            .connection()
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

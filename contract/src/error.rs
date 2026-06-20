@@ -14,4 +14,7 @@ pub enum VaultError {
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+
+    #[error("database error: {detail}")]
+    Database { detail: String },
 }
