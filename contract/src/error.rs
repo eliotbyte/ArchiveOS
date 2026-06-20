@@ -17,4 +17,13 @@ pub enum VaultError {
 
     #[error("database error: {detail}")]
     Database { detail: String },
+
+    #[error("registry entry not found: {name}")]
+    RegistryNotFound { name: String },
+
+    #[error("vault '{name}' is unavailable")]
+    VaultUnavailable { name: String },
+
+    #[error("registry conflict: {detail}")]
+    RegistryConflict { detail: String },
 }

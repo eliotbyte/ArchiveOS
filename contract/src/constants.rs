@@ -5,3 +5,4 @@ pub const BLOBS_DIR: &str = "blobs";
 pub const STAGING_DIR: &str = "staging";
 pub const LAYOUT_VERSION: u32 = 1;
 pub const DB_SCHEMA_VERSION: i32 = 1;
+pub const REGISTRY_DB: &str = "registry.sqlite";
