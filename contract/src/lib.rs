@@ -2,6 +2,7 @@ pub mod constants;
 pub mod error;
 pub mod import;
 pub mod metadata;
+pub mod entity;
 pub mod registry;
 
 pub use constants::*;
@@ -12,3 +13,4 @@ pub use import::{
 };
 pub use metadata::VaultMetadata;
 pub use registry::{VaultRegistryEntry, VaultStatus};
+pub use entity::{EntityHit, SearchQuery};

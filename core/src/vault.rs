@@ -118,6 +118,22 @@ impl Vault {
     ) -> Result<ImportReport, VaultError> {
         crate::import::import(self, staging_dir, manifest, strategy)
     }
+
+    pub fn add_tag(&self, entity_id: Uuid, tag: &str) -> Result<(), VaultError> {
+        crate::tags::add_tag(self.connection(), entity_id, tag)
+    }
+
+    pub fn remove_tag(&self, entity_id: Uuid, tag: &str) -> Result<(), VaultError> {
+        crate::tags::remove_tag(self.connection(), entity_id, tag)
+    }
+
+    pub fn list_tags(&self, entity_id: Uuid) -> Result<Vec<String>, VaultError> {
+        crate::tags::list_entity_tags(self.connection(), entity_id)
+    }
+
+    pub fn search(&self, query: &archiveos_contract::SearchQuery) -> Result<Vec<archiveos_contract::EntityHit>, VaultError> {
+        crate::search::search(self.connection(), query)
+    }
 }
 
 #[cfg(test)]

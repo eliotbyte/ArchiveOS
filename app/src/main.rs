@@ -2,9 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use archiveos_contract::{ImportManifest, ImportStrategy};
+use archiveos_contract::{ImportManifest, ImportStrategy, SearchQuery};
 use archiveos_core::{open_vault_ref, Registry, Vault};
 use clap::{Parser, Subcommand};
+use uuid::Uuid;
 
 const DEFAULT_CONFIG_DIR: &str = "config";
 
@@ -28,6 +29,33 @@ enum Command {
     Registry {
         #[command(subcommand)]
         action: RegistryAction,
+    },
+    Tag {
+        #[command(subcommand)]
+        action: TagAction,
+    },
+    Search {
+        vault: String,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TagAction {
+    /// Attach tag to entity
+    Add {
+        vault: String,
+        entity: String,
+        name: String,
+    },
+    /// Detach tag from entity
+    Remove {
+        vault: String,
+        entity: String,
+        name: String,
     },
 }
 
@@ -98,6 +126,40 @@ fn main() -> Result<()> {
                 for entry in entries {
                     println!("name={} status={:?}", entry.name, entry.status);
                 }
+            }
+        },
+        Command::Tag { action } => match action {
+            TagAction::Add { vault, entity, name } => {
+                let vault = open_vault_ref(Some(&registry), &vault)
+                    .context("failed to open vault")?;
+                let entity_id = Uuid::parse_str(&entity).context("invalid entity uuid")?;
+                vault.add_tag(entity_id, &name).context("failed to add tag")?;
+                println!("tagged entity={entity_id} tag={name}");
+            }
+            TagAction::Remove { vault, entity, name } => {
+                let vault = open_vault_ref(Some(&registry), &vault)
+                    .context("failed to open vault")?;
+                let entity_id = Uuid::parse_str(&entity).context("invalid entity uuid")?;
+                vault
+                    .remove_tag(entity_id, &name)
+                    .context("failed to remove tag")?;
+                println!("untagged entity={entity_id} tag={name}");
+            }
+        },
+        Command::Search { vault, tag, query } => {
+            let vault = open_vault_ref(Some(&registry), &vault)
+                .context("failed to open vault")?;
+            let hits = vault
+                .search(&SearchQuery { tag, text: query })
+                .context("search failed")?;
+            for hit in hits {
+                let tags = hit.tags.join(",");
+                let title = hit.title.unwrap_or_default();
+                println!(
+                    "entity_id={} title={title} mime={} tags={tags}",
+                    hit.id,
+                    hit.mime.unwrap_or_default(),
+                );
             }
         },
         Command::Vault { action } => match action {
