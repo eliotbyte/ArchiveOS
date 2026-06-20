@@ -83,6 +83,19 @@ pub fn update_entity_content(
     Ok(())
 }
 
+pub fn update_entity_created_at(
+    conn: &Connection,
+    id: Uuid,
+    created_at: &str,
+) -> Result<(), VaultError> {
+    conn.execute(
+        "UPDATE entity SET created_at = ?1 WHERE id = ?2",
+        params![created_at, id.to_string()],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 pub fn insert_collection(
     conn: &Connection,
     id: Uuid,

@@ -13,6 +13,9 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 walkdir = "2"
 mime_guess = "2"
+kamadak-exif = "0.6"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
 [dev-dependencies]
 tempfile = "3"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

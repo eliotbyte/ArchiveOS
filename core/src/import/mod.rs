@@ -130,6 +130,8 @@ fn import_manifest_item(
 ) -> Result<(), VaultError> {
     let file_path = resolve_item_path(staging_dir, &item.path, strategy)?;
     let ext = extension_from_path(&file_path);
+    let image_meta = crate::media::image::extract(&file_path);
+    let modified_at = file_modified_at(&file_path);
 
     let (content_hash, size, mime, blob_stored) = match strategy {
         ImportStrategy::Managed => {
@@ -188,6 +190,8 @@ fn import_manifest_item(
         ingest_metadata(conn, entity_id, metadata)?;
     }
 
+    crate::media::image::persist(conn, entity_id, &image_meta, modified_at.as_deref())?;
+
     let _ = blob_stored;
     Ok(())
 }
@@ -208,6 +212,8 @@ fn import_scan(
             continue;
         }
         let file_path = entry.into_path();
+        let image_meta = crate::media::image::extract(&file_path);
+        let modified_at = file_modified_at(&file_path);
         let content_hash = cas::hash_file(&file_path)?;
         let size = fs::metadata(&file_path)?.len();
         let mime = guess_mime(&file_path);
@@ -226,6 +232,8 @@ fn import_scan(
         if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
             db::upsert_metadata(conn, entity_id, "title", name, "inferred")?;
         }
+
+        crate::media::image::persist(conn, entity_id, &image_meta, modified_at.as_deref())?;
     }
 
     Ok(())
@@ -313,6 +321,13 @@ fn guess_mime(path: &Path) -> String {
     mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string()
+}
+
+fn file_modified_at(path: &Path) -> Option<String> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .map(|time| chrono::DateTime::<Utc>::from(time).to_rfc3339())
 }
 
 fn extension_from_path(path: &Path) -> String {

@@ -5,6 +5,7 @@ pub mod import;
 pub mod inbox;
 pub mod jobs;
 pub mod layout;
+pub mod media;
 pub mod registry;
 pub mod search;
 pub mod sources;

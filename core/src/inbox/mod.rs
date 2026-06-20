@@ -117,6 +117,11 @@ fn import_file(
     let meta = fs::metadata(file_path)?;
     let created_at = file_created_at(&meta);
     let modified_at = file_modified_at(&meta);
+    let image_meta = crate::media::image::extract(file_path);
+    let entity_created_at = image_meta
+        .taken_at
+        .as_deref()
+        .or(created_at.as_deref());
     let ext = extension_from_path(file_path);
     let cas = cas::store_managed(vault.root(), file_path, &ext)?;
     let mime = guess_mime(&cas.blob_path);
@@ -137,7 +142,7 @@ fn import_file(
             cas.size,
             "present",
             &now,
-            created_at.as_deref(),
+            entity_created_at,
         )?;
         report.files_imported += 1;
         id
@@ -146,9 +151,12 @@ fn import_file(
     if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
         db::upsert_metadata(conn, entity_id, "title", name, "inferred")?;
     }
-    if let Some(modified_at) = modified_at {
-        db::upsert_metadata(conn, entity_id, "modified_at", &modified_at, "extracted")?;
-    }
+    crate::media::image::persist(
+        conn,
+        entity_id,
+        &image_meta,
+        modified_at.as_deref(),
+    )?;
 
     Ok(entity_id)
 }
