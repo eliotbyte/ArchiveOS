@@ -101,14 +101,13 @@ fn import_folder_tree(
         .to_string();
     let relative_path = relative_path_from_drop(drop_root, folder);
     let conn = vault.connection();
-    let collection_id = create_folder_collection(conn, &title, &relative_path)?;
+    let collection_id = find_or_create_folder_collection(conn, &title, &relative_path, report)?;
 
     for (entity_id, position) in members {
         db::link_collection_member_direct(conn, collection_id, entity_id, position)?;
     }
 
     fs::remove_dir_all(folder)?;
-    report.collections_created += 1;
     Ok(Some(collection_id))
 }
 
@@ -137,6 +136,20 @@ fn relative_path_from_drop(drop_root: &Path, path: &Path) -> String {
     } else {
         format!("{root_name}/{suffix}")
     }
+}
+
+fn find_or_create_folder_collection(
+    conn: &Connection,
+    title: &str,
+    relative_path: &str,
+    report: &mut InboxReport,
+) -> Result<Uuid, VaultError> {
+    if let Some(existing) = db::find_entity_by_source_ref(conn, "inbox", "folder", relative_path)? {
+        return Ok(existing);
+    }
+    let id = create_folder_collection(conn, title, relative_path)?;
+    report.collections_created += 1;
+    Ok(id)
 }
 
 fn create_folder_collection(
@@ -368,6 +381,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relative_path, "parent/folder a/a.jpg");
+    }
+
+    #[test]
+    fn process_inbox_reuses_existing_files_and_albums() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+
+        let loose = vault.inbox_dir().join("dup.jpg");
+        fs::write(&loose, b"same-bytes").unwrap();
+        process_inbox(&vault).unwrap();
+
+        let album = vault.inbox_dir().join("my album");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("dup.jpg"), b"same-bytes").unwrap();
+        let report = process_inbox(&vault).unwrap();
+
+        assert_eq!(report.files_imported, 0);
+        assert_eq!(report.entities_reused, 1);
+
+        let entity_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM entity WHERE content_hash IS NOT NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(entity_count, 1);
+
+        let membership_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM collection_member",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_count, 1);
+    }
+
+    #[test]
+    fn process_inbox_reuses_existing_album_by_source_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+
+        let album = vault.inbox_dir().join("vacation");
+        fs::create_dir_all(&album).unwrap();
+        fs::write(album.join("a.jpg"), b"a").unwrap();
+        process_inbox(&vault).unwrap();
+
+        fs::create_dir_all(vault.inbox_dir().join("vacation")).unwrap();
+        fs::write(vault.inbox_dir().join("vacation/b.jpg"), b"b").unwrap();
+        let report = process_inbox(&vault).unwrap();
+
+        assert_eq!(report.collections_created, 0);
+        assert_eq!(report.files_imported, 1);
+
+        let album_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM collection WHERE title = 'vacation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(album_count, 1);
+
+        let member_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM collection_member cm
+                 JOIN collection c ON c.id = cm.collection_id
+                 WHERE c.title = 'vacation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(member_count, 2);
     }
 
     #[test]
