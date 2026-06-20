@@ -1,13 +1,133 @@
-//! Vault lifecycle.
-
+use std::fs;
 use std::path::{Path, PathBuf};
+
+use archiveos_contract::{
+    VaultError, VaultMetadata, ARCHIVEOS_DIR, BLOBS_DIR, DB_FILE, STAGING_DIR, VAULT_JSON,
+};
+use chrono::Utc;
+use uuid::Uuid;
+
+use crate::layout::{
+    blob_path as layout_blob_path, is_dir_empty, staging_job_path, validate_layout,
+};
 
 pub struct Vault {
     root: PathBuf,
+    metadata: VaultMetadata,
 }
 
 impl Vault {
+    pub fn init(root: impl AsRef<Path>) -> Result<Self, VaultError> {
+        let root = root.as_ref().to_path_buf();
+
+        if root.exists() {
+            if !is_dir_empty(&root)? {
+                return Err(VaultError::AlreadyExists);
+            }
+        } else {
+            fs::create_dir_all(&root)?;
+        }
+
+        let archiveos = root.join(ARCHIVEOS_DIR);
+        fs::create_dir_all(&archiveos)?;
+
+        let metadata = VaultMetadata::new(Uuid::new_v4(), Utc::now());
+        let vault_json = archiveos.join(VAULT_JSON);
+        fs::write(&vault_json, serde_json::to_string_pretty(&metadata)?)?;
+
+        fs::write(archiveos.join(DB_FILE), [])?;
+        fs::create_dir_all(root.join(BLOBS_DIR))?;
+        fs::create_dir_all(root.join(STAGING_DIR))?;
+
+        Ok(Self { root, metadata })
+    }
+
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, VaultError> {
+        let root = root.as_ref().to_path_buf();
+        let metadata = validate_layout(&root)?;
+        Ok(Self { root, metadata })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.metadata.id
+    }
+
+    pub fn metadata(&self) -> &VaultMetadata {
+        &self.metadata
+    }
+
+    pub fn archiveos_dir(&self) -> PathBuf {
+        self.root.join(ARCHIVEOS_DIR)
+    }
+
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join(BLOBS_DIR)
+    }
+
+    pub fn staging_dir(&self) -> PathBuf {
+        self.root.join(STAGING_DIR)
+    }
+
+    pub fn db_path(&self) -> PathBuf {
+        self.archiveos_dir().join(DB_FILE)
+    }
+
+    pub fn blob_path(&self, hash: &str, ext: &str) -> Result<PathBuf, VaultError> {
+        layout_blob_path(&self.root, hash, ext)
+    }
+
+    pub fn staging_job_dir(&self, job_id: &str) -> PathBuf {
+        staging_job_path(&self.root, job_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use archiveos_contract::VaultError;
+    use tempfile::tempdir;
+
+    #[test]
+    fn init_creates_expected_layout() {
+        let parent = tempdir().unwrap();
+        let vault_path = parent.path().join("my-vault");
+        let vault = Vault::init(&vault_path).unwrap();
+
+        assert!(vault_path.join(".archiveos/vault.json").is_file());
+        assert!(vault_path.join(".archiveos/db.sqlite").is_file());
+        assert!(vault_path.join("blobs").is_dir());
+        assert!(vault_path.join("staging").is_dir());
+        assert_eq!(vault.root(), vault_path.as_path());
+    }
+
+    #[test]
+    fn init_fails_on_nonempty_dir() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("existing.txt"), b"x").unwrap();
+        assert!(matches!(
+            Vault::init(dir.path()),
+            Err(VaultError::AlreadyExists)
+        ));
+    }
+
+    #[test]
+    fn open_succeeds_after_init() {
+        let parent = tempdir().unwrap();
+        let vault_path = parent.path().join("v");
+        let v1 = Vault::init(&vault_path).unwrap();
+        let v2 = Vault::open(&vault_path).unwrap();
+        assert_eq!(v1.id(), v2.id());
+    }
+
+    #[test]
+    fn open_fails_on_missing_blobs() {
+        let dir = tempdir().unwrap();
+        Vault::init(dir.path()).unwrap();
+        std::fs::remove_dir_all(dir.path().join("blobs")).unwrap();
+        assert!(Vault::open(dir.path()).is_err());
     }
 }
