@@ -195,6 +195,15 @@ pub fn link_collection_member(
         return Ok(false);
     };
 
+    link_collection_member_direct(conn, collection_id, entity_id, position)
+}
+
+pub fn link_collection_member_direct(
+    conn: &Connection,
+    collection_id: Uuid,
+    entity_id: Uuid,
+    position: i32,
+) -> Result<bool, VaultError> {
     conn.execute(
         "INSERT INTO collection_member (collection_id, entity_id, position)
          VALUES (?1, ?2, ?3)

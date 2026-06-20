@@ -1,4 +1,5 @@
 mod error;
+mod inbox_watcher;
 mod routes;
 
 use std::net::SocketAddr;
@@ -40,6 +41,13 @@ async fn main() {
         tracing::warn!("default vault bootstrap skipped: {err}");
     }
 
+    if inbox_watcher::enabled() {
+        let vault_name = std::env::var("ARCHIVEOS_DEFAULT_VAULT")
+            .expect("ARCHIVEOS_DEFAULT_VAULT required when inbox watch enabled");
+        inbox_watcher::spawn(config_dir.clone(), vault_name);
+        tracing::info!("inbox watcher started");
+    }
+
     let state = Arc::new(AppState { config_dir });
     let app = Router::new()
         .merge(routes::router())
@@ -66,7 +74,7 @@ fn bootstrap_default_vault(config_dir: &PathBuf) -> Result<(), archiveos_contrac
     }
 
     if Vault::open(&path).is_err() {
-        Vault::init(&path)?;
+        Vault::ensure(&path)?;
         tracing::info!("initialized vault at {}", path.display());
     }
 

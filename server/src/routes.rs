@@ -62,7 +62,7 @@ fn ensure_vault_ready(path: &str, init: bool) -> ApiResult<()> {
     }
     let path = std::path::Path::new(path);
     if Vault::open(path).is_err() {
-        Vault::init(path)?;
+        Vault::ensure(path)?;
     }
     Ok(())
 }

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use archiveos_contract::{
     ImportManifest, ImportReport, ImportStrategy, VaultError, VaultMetadata, ARCHIVEOS_DIR,
-    BLOBS_DIR, DB_FILE, STAGING_DIR, VAULT_JSON,
+    BLOBS_DIR, DB_FILE, INBOX_DIR, STAGING_DIR, VAULT_JSON,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -43,6 +43,7 @@ impl Vault {
         fs::write(archiveos.join(DB_FILE), [])?;
         fs::create_dir_all(root.join(BLOBS_DIR))?;
         fs::create_dir_all(root.join(STAGING_DIR))?;
+        fs::create_dir_all(root.join(INBOX_DIR))?;
 
         let db = open_connection(&archiveos.join(DB_FILE))?;
         migrate(&db)?;
@@ -53,8 +54,52 @@ impl Vault {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, VaultError> {
         let root = root.as_ref().to_path_buf();
         let metadata = validate_layout(&root)?;
+        crate::inbox::ensure_inbox_dir(&root)?;
         let db = open_connection(&root.join(ARCHIVEOS_DIR).join(DB_FILE))?;
         migrate(&db)?;
+        Ok(Self { root, metadata, db })
+    }
+
+    /// Open an existing vault or create layout under `root` (allows non-empty host dirs).
+    pub fn ensure(root: impl AsRef<Path>) -> Result<Self, VaultError> {
+        let root = root.as_ref();
+        if let Ok(vault) = Self::open(root) {
+            return Ok(vault);
+        }
+        if !root.exists() || is_dir_empty(root)? {
+            return Self::init(root);
+        }
+        Self::bootstrap_layout(root)
+    }
+
+    fn bootstrap_layout(root: impl AsRef<Path>) -> Result<Self, VaultError> {
+        let root = root.as_ref().to_path_buf();
+        fs::create_dir_all(&root)?;
+
+        let archiveos = root.join(ARCHIVEOS_DIR);
+        fs::create_dir_all(&archiveos)?;
+        fs::create_dir_all(root.join(BLOBS_DIR))?;
+        fs::create_dir_all(root.join(STAGING_DIR))?;
+        fs::create_dir_all(root.join(INBOX_DIR))?;
+
+        let vault_json = archiveos.join(VAULT_JSON);
+        let metadata = if vault_json.is_file() {
+            let contents = fs::read_to_string(&vault_json)?;
+            serde_json::from_str(&contents)?
+        } else {
+            let metadata = VaultMetadata::new(Uuid::new_v4(), Utc::now());
+            fs::write(&vault_json, serde_json::to_string_pretty(&metadata)?)?;
+            metadata
+        };
+
+        let db_path = archiveos.join(DB_FILE);
+        if !db_path.is_file() {
+            fs::write(&db_path, [])?;
+        }
+
+        let db = open_connection(&db_path)?;
+        migrate(&db)?;
+
         Ok(Self { root, metadata, db })
     }
 
@@ -84,6 +129,10 @@ impl Vault {
 
     pub fn staging_dir(&self) -> PathBuf {
         self.root.join(STAGING_DIR)
+    }
+
+    pub fn inbox_dir(&self) -> PathBuf {
+        self.root.join(INBOX_DIR)
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -117,6 +166,10 @@ impl Vault {
         strategy: ImportStrategy,
     ) -> Result<ImportReport, VaultError> {
         crate::import::import(self, staging_dir, manifest, strategy)
+    }
+
+    pub fn process_inbox(&self) -> Result<crate::inbox::InboxReport, VaultError> {
+        crate::inbox::process_inbox(self)
     }
 
     pub fn add_tag(&self, entity_id: Uuid, tag: &str) -> Result<(), VaultError> {
@@ -181,6 +234,7 @@ mod tests {
         assert!(vault_path.join(".archiveos/db.sqlite").is_file());
         assert!(vault_path.join("blobs").is_dir());
         assert!(vault_path.join("staging").is_dir());
+        assert!(vault_path.join("inbox").is_dir());
         assert_eq!(vault.root(), vault_path.as_path());
     }
 
