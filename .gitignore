@@ -8,3 +8,7 @@ PROJECT.md
 AGENTS.md
 CLAUDE.md
 .cursor/
+
+# Local Docker overrides
+docker-compose.local.yml
+/vaults/

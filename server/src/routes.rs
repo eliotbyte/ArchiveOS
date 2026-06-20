@@ -42,14 +42,29 @@ async fn list_vaults(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<V
 struct RegisterVaultRequest {
     name: String,
     path: String,
+    /// Create vault layout at `path` when missing (Docker / first-run).
+    #[serde(default)]
+    init: bool,
 }
 
 async fn register_vault(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RegisterVaultRequest>,
 ) -> ApiResult<Json<VaultRegistryEntry>> {
+    ensure_vault_ready(&body.path, body.init)?;
     let registry = state.registry()?;
     Ok(Json(registry.register(&body.name, &body.path)?))
+}
+
+fn ensure_vault_ready(path: &str, init: bool) -> ApiResult<()> {
+    if !init {
+        return Ok(());
+    }
+    let path = std::path::Path::new(path);
+    if Vault::open(path).is_err() {
+        Vault::init(path)?;
+    }
+    Ok(())
 }
 
 async fn unregister_vault(
