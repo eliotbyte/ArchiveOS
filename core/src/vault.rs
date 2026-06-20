@@ -8,6 +8,7 @@ use chrono::Utc;
 use rusqlite::Connection;
 use uuid::Uuid;
 
+use crate::cas::{self, CasStoreResult};
 use crate::db::{migrate, open_connection};
 use crate::layout::{
     blob_path as layout_blob_path, is_dir_empty, staging_job_path, validate_layout,
@@ -95,6 +96,18 @@ impl Vault {
     pub fn staging_job_dir(&self, job_id: &str) -> PathBuf {
         staging_job_path(&self.root, job_id)
     }
+
+    pub fn store_managed(
+        &self,
+        staging_file: &Path,
+        ext: &str,
+    ) -> Result<CasStoreResult, VaultError> {
+        cas::store_managed(&self.root, staging_file, ext)
+    }
+
+    pub fn blob_exists(&self, hash: &str, ext: &str) -> Result<bool, VaultError> {
+        cas::blob_exists(&self.root, hash, ext)
+    }
 }
 
 #[cfg(test)]
@@ -168,5 +181,19 @@ mod tests {
         Vault::init(dir.path()).unwrap();
         std::fs::remove_dir_all(dir.path().join("blobs")).unwrap();
         assert!(Vault::open(dir.path()).is_err());
+    }
+
+    #[test]
+    fn store_managed_via_vault() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let staging = vault.staging_job_dir("job-1").join("files/clip.jpg");
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        std::fs::write(&staging, b"image-data").unwrap();
+
+        let result = vault.store_managed(&staging, ".jpg").unwrap();
+        assert!(!result.deduped);
+        assert!(result.blob_path.starts_with(vault.blobs_dir()));
+        assert!(vault.blob_exists(&result.content_hash, ".jpg").unwrap());
     }
 }
