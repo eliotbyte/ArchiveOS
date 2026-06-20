@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use archiveos_contract::{
-    VaultError, VaultMetadata, ARCHIVEOS_DIR, BLOBS_DIR, DB_FILE, STAGING_DIR, VAULT_JSON,
+    ImportManifest, ImportReport, ImportStrategy, VaultError, VaultMetadata, ARCHIVEOS_DIR,
+    BLOBS_DIR, DB_FILE, STAGING_DIR, VAULT_JSON,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -107,6 +108,15 @@ impl Vault {
 
     pub fn blob_exists(&self, hash: &str, ext: &str) -> Result<bool, VaultError> {
         cas::blob_exists(&self.root, hash, ext)
+    }
+
+    pub fn import(
+        &self,
+        staging_dir: &Path,
+        manifest: Option<&ImportManifest>,
+        strategy: ImportStrategy,
+    ) -> Result<ImportReport, VaultError> {
+        crate::import::import(self, staging_dir, manifest, strategy)
     }
 }
 

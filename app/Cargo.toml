@@ -12,3 +12,4 @@ archiveos-core = { path = "../core" }
 archiveos-contract = { path = "../contract" }
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
+serde_json = "1"
