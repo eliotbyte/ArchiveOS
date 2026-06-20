@@ -134,6 +134,35 @@ impl Vault {
     pub fn search(&self, query: &archiveos_contract::SearchQuery) -> Result<Vec<archiveos_contract::EntityHit>, VaultError> {
         crate::search::search(self.connection(), query)
     }
+
+    pub fn get_entity(&self, entity_id: Uuid) -> Result<crate::entity::EntityDetail, VaultError> {
+        crate::entity::get_entity(self.connection(), entity_id)
+    }
+
+    pub fn create_job(&self, job_type: &str, target_vault: &str, input: &str) -> Result<crate::jobs::Job, VaultError> {
+        crate::jobs::create_job(self.connection(), job_type, target_vault, input)
+    }
+
+    pub fn claim_job(&self, lease_secs: i64) -> Result<Option<crate::jobs::Job>, VaultError> {
+        crate::jobs::claim_job(self.connection(), lease_secs)
+    }
+
+    pub fn finish_job(&self, job_id: Uuid, status: &str) -> Result<(), VaultError> {
+        crate::jobs::finish_job(self.connection(), job_id, status)
+    }
+
+    pub fn get_job(&self, job_id: Uuid) -> Result<Option<crate::jobs::Job>, VaultError> {
+        crate::jobs::get_job(self.connection(), job_id)
+    }
+
+    pub fn sources_has(
+        &self,
+        source: &str,
+        kind: &str,
+        external_ids: &[String],
+    ) -> Result<Vec<crate::sources::SourceHasHit>, VaultError> {
+        crate::sources::sources_has(self.connection(), source, kind, external_ids)
+    }
 }
 
 #[cfg(test)]

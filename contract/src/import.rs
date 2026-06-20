@@ -57,7 +57,7 @@ pub struct ManifestMembership {
     pub position: i32,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportReport {
     pub entities_created: usize,
     pub entities_reused: usize,

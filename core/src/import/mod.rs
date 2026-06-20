@@ -1,4 +1,4 @@
-mod db;
+pub mod db;
 
 use std::fs;
 use std::path::{Path, PathBuf};
