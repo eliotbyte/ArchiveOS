@@ -103,11 +103,87 @@ pub fn insert_collection(
     title: &str,
 ) -> Result<(), VaultError> {
     conn.execute(
-        "INSERT INTO collection (id, type, title) VALUES (?1, ?2, ?3)",
+        "INSERT INTO collection (id, type, title, content_fingerprint) VALUES (?1, ?2, ?3, NULL)",
         params![id.to_string(), collection_type, title],
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+pub fn find_collection_by_fingerprint(
+    conn: &Connection,
+    fingerprint: &str,
+) -> Result<Option<Uuid>, VaultError> {
+    conn.query_row(
+        "SELECT id FROM collection WHERE content_fingerprint = ?1",
+        [fingerprint],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .map(|id| {
+        Uuid::parse_str(&id).map_err(|e| VaultError::InvalidLayout {
+            detail: e.to_string(),
+        })
+    })
+    .transpose()
+}
+
+pub fn set_collection_fingerprint(
+    conn: &Connection,
+    id: Uuid,
+    fingerprint: &str,
+) -> Result<(), VaultError> {
+    conn.execute(
+        "UPDATE collection SET content_fingerprint = ?1 WHERE id = ?2",
+        params![fingerprint, id.to_string()],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
+pub fn collection_has_source_path(
+    conn: &Connection,
+    collection_id: Uuid,
+    path: &str,
+) -> Result<bool, VaultError> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM source_ref
+             WHERE entity_id = ?1 AND source = 'inbox' AND kind = 'folder' AND external_id = ?2",
+            params![collection_id.to_string(), path],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(db_err)?
+        .is_some())
+}
+
+pub fn add_collection_source_path(
+    conn: &Connection,
+    collection_id: Uuid,
+    path: &str,
+) -> Result<(), VaultError> {
+    if collection_has_source_path(conn, collection_id, path)? {
+        return Ok(());
+    }
+
+    if let Some(existing) = find_entity_by_source_ref(conn, "inbox", "folder", path)?
+        && existing != collection_id
+    {
+        return Ok(());
+    }
+
+    insert_source_ref(
+        conn,
+        Uuid::new_v4(),
+        collection_id,
+        "inbox",
+        "folder",
+        path,
+        None,
+        "live",
+    )
 }
 
 #[expect(clippy::too_many_arguments, reason = "maps 1:1 to source_ref table columns")]

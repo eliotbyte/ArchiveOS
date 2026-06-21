@@ -1,3 +1,6 @@
+mod fingerprint;
+mod path_tags;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -9,7 +12,11 @@ use uuid::Uuid;
 
 use crate::cas;
 use crate::import::db;
+use crate::tags::add_tag;
 use crate::Vault;
+
+pub use fingerprint::compute_collection_fingerprint;
+pub use path_tags::{discover_leaf_folders, LeafFolder};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct InboxReport {
@@ -53,101 +60,82 @@ pub fn process_inbox(vault: &Vault) -> Result<InboxReport, VaultError> {
 }
 
 fn import_folder(vault: &Vault, folder: &Path, report: &mut InboxReport) -> Result<(), VaultError> {
-    import_folder_tree(vault, folder, folder, report)?;
+    let leaves = discover_leaf_folders(folder).map_err(|err| VaultError::Io(err))?;
+    if leaves.is_empty() {
+        fs::remove_dir_all(folder)?;
+        return Ok(());
+    }
+
+    for leaf in leaves {
+        import_leaf_folder(vault, folder, &leaf, report)?;
+    }
+
+    fs::remove_dir_all(folder)?;
     Ok(())
 }
 
-/// Import `folder` and nested subfolders as a collection tree rooted at `drop_root`.
-fn import_folder_tree(
+fn import_leaf_folder(
     vault: &Vault,
     drop_root: &Path,
-    folder: &Path,
+    leaf: &LeafFolder,
     report: &mut InboxReport,
-) -> Result<Option<Uuid>, VaultError> {
-    let mut children: Vec<PathBuf> = fs::read_dir(folder)?
-        .filter_map(|entry| entry.ok().map(|e| e.path()))
-        .filter(|path| !should_skip_name(path.file_name()))
-        .collect();
-    children.sort();
-
+) -> Result<(), VaultError> {
     let mut members = Vec::new();
+    let mut file_hashes = Vec::new();
 
-    for (position, path) in children.into_iter().enumerate() {
-        let position = i32::try_from(position).unwrap_or(i32::MAX);
-        if path.is_file() {
-            let relative_path = relative_path_from_drop(drop_root, &path);
-            let entity_id = import_file(vault, &path, Some(&relative_path), report)?;
-            members.push((entity_id, position));
-        } else if path.is_dir() {
-            if let Some(child_collection_id) =
-                import_folder_tree(vault, drop_root, &path, report)?
-            {
-                members.push((child_collection_id, position));
-            }
-        }
+    for (position, file_path) in leaf.files.iter().enumerate() {
+        let file_source_path = file_source_path(drop_root, file_path);
+        let entity_id = import_file(vault, file_path, Some(&file_source_path), report)?;
+        members.push((entity_id, i32::try_from(position).unwrap_or(i32::MAX)));
+
+        let hash: String = vault
+            .connection()
+            .query_row(
+                "SELECT content_hash FROM entity WHERE id = ?1",
+                [entity_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|err| VaultError::Database {
+                detail: err.to_string(),
+            })?;
+        file_hashes.push(hash);
     }
 
-    if members.is_empty() {
-        if folder != drop_root {
-            fs::remove_dir_all(folder)?;
-        }
-        return Ok(None);
-    }
-
-    let title = folder
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("album")
-        .to_string();
-    let relative_path = relative_path_from_drop(drop_root, folder);
+    let fingerprint = compute_collection_fingerprint(&file_hashes);
     let conn = vault.connection();
-    let collection_id = find_or_create_folder_collection(conn, &title, &relative_path, report)?;
+    let collection_id = find_or_create_collection_by_fingerprint(
+        conn,
+        &leaf.title,
+        &fingerprint,
+        &leaf.source_path,
+        &leaf.path_tags,
+        report,
+    )?;
 
     for (entity_id, position) in members {
         db::link_collection_member_direct(conn, collection_id, entity_id, position)?;
     }
 
-    fs::remove_dir_all(folder)?;
-    Ok(Some(collection_id))
+    Ok(())
 }
 
-fn relative_path_from_drop(drop_root: &Path, path: &Path) -> String {
-    let root_name = drop_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("album");
-
-    if path == drop_root {
-        return root_name.to_string();
-    }
-
-    let suffix = path
-        .strip_prefix(drop_root)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .filter(|p| !p.is_empty())
-        .unwrap_or_default();
-
-    if suffix.is_empty() {
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(root_name)
-            .to_string()
-    } else {
-        format!("{root_name}/{suffix}")
-    }
-}
-
-fn find_or_create_folder_collection(
+fn find_or_create_collection_by_fingerprint(
     conn: &Connection,
     title: &str,
-    relative_path: &str,
+    fingerprint: &str,
+    source_path: &str,
+    path_tags: &[String],
     report: &mut InboxReport,
 ) -> Result<Uuid, VaultError> {
-    if let Some(existing) = db::find_entity_by_source_ref(conn, "inbox", "folder", relative_path)? {
+    if let Some(existing) = db::find_collection_by_fingerprint(conn, fingerprint)? {
+        db::add_collection_source_path(conn, existing, source_path)?;
+        apply_path_tags(conn, existing, path_tags)?;
+        db::upsert_metadata(conn, existing, "source_relative_path", source_path, "system")?;
         return Ok(existing);
     }
-    let id = create_folder_collection(conn, title, relative_path)?;
+
+    let id = create_folder_collection(conn, title, source_path, fingerprint)?;
+    apply_path_tags(conn, id, path_tags)?;
     report.collections_created += 1;
     Ok(id)
 }
@@ -155,25 +143,34 @@ fn find_or_create_folder_collection(
 fn create_folder_collection(
     conn: &Connection,
     title: &str,
-    relative_path: &str,
+    source_path: &str,
+    fingerprint: &str,
 ) -> Result<Uuid, VaultError> {
     let id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
     db::insert_entity(conn, id, None, None, 0, "present", &now, None)?;
     db::insert_collection(conn, id, "folder", title)?;
-    db::insert_source_ref(
-        conn,
-        Uuid::new_v4(),
-        id,
-        "inbox",
-        "folder",
-        relative_path,
-        None,
-        "live",
-    )?;
-    db::upsert_metadata(conn, id, "source_relative_path", relative_path, "system")?;
+    db::set_collection_fingerprint(conn, id, fingerprint)?;
+    db::add_collection_source_path(conn, id, source_path)?;
+    db::upsert_metadata(conn, id, "source_relative_path", source_path, "system")?;
     db::upsert_metadata(conn, id, "source_kind", "inbox_folder", "system")?;
     Ok(id)
+}
+
+fn apply_path_tags(conn: &Connection, collection_id: Uuid, path_tags: &[String]) -> Result<(), VaultError> {
+    for tag in path_tags {
+        add_tag(conn, collection_id, tag)?;
+    }
+    Ok(())
+}
+
+fn file_source_path(drop_root: &Path, file_path: &Path) -> String {
+    path_tags::source_path_from_drop(drop_root, file_path.parent().unwrap_or(drop_root))
+        + "/"
+        + file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
 }
 
 fn import_file(
@@ -280,6 +277,28 @@ mod tests {
     use super::*;
     use walkdir::WalkDir;
 
+    fn count_collections(vault: &Vault) -> i32 {
+        vault
+            .connection()
+            .query_row("SELECT COUNT(*) FROM collection", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn count_source_refs_for_collection(vault: &Vault, collection_id: Uuid) -> i32 {
+        vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM source_ref WHERE entity_id = ?1 AND kind = 'folder'",
+                [collection_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn collection_tags(vault: &Vault, collection_id: Uuid) -> Vec<String> {
+        crate::tags::list_entity_tags(vault.connection(), collection_id).unwrap()
+    }
+
     #[test]
     fn process_inbox_imports_file_into_blobs() {
         let dir = tempfile::tempdir().unwrap();
@@ -325,62 +344,103 @@ mod tests {
     }
 
     #[test]
-    fn process_inbox_imports_nested_folders_as_collection_tree() {
+    fn process_inbox_merges_same_content_from_different_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+
+        let first = vault.inbox_dir().join("images/sort/album1");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("peach.jpg"), b"same").unwrap();
+        process_inbox(&vault).unwrap();
+
+        let second = vault.inbox_dir().join("images/album1");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("peach.jpg"), b"same").unwrap();
+        let report = process_inbox(&vault).unwrap();
+
+        assert_eq!(report.collections_created, 0);
+        assert_eq!(count_collections(&vault), 1);
+
+        let collection_id: Uuid = vault
+            .connection()
+            .query_row("SELECT id FROM collection LIMIT 1", [], |row| {
+                let id: String = row.get(0)?;
+                Ok(Uuid::parse_str(&id).unwrap())
+            })
+            .unwrap();
+        assert_eq!(count_source_refs_for_collection(&vault, collection_id), 2);
+        assert_eq!(
+            collection_tags(&vault, collection_id),
+            vec!["images".to_string(), "sort".to_string()]
+        );
+    }
+
+    #[test]
+    fn process_inbox_keeps_same_title_with_different_content_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+
+        let first = vault.inbox_dir().join("album1");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("peach.jpg"), b"peach").unwrap();
+        process_inbox(&vault).unwrap();
+
+        let second = vault.inbox_dir().join("album1");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("banana.jpg"), b"banana").unwrap();
+        let report = process_inbox(&vault).unwrap();
+
+        assert_eq!(report.collections_created, 1);
+        assert_eq!(count_collections(&vault), 2);
+    }
+
+    #[test]
+    fn process_inbox_creates_leaf_albums_without_parent_collection() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::init(dir.path()).unwrap();
         let root = vault.inbox_dir().join("parent");
-        let sub_a = root.join("folder a");
-        let sub_b = root.join("folder b");
-        fs::create_dir_all(&sub_a).unwrap();
-        fs::create_dir_all(&sub_b).unwrap();
-        fs::write(sub_a.join("a.jpg"), b"a").unwrap();
-        fs::write(sub_b.join("b.jpg"), b"b").unwrap();
+        fs::create_dir_all(root.join("folder2")).unwrap();
+        fs::create_dir_all(root.join("domik")).unwrap();
+        fs::write(root.join("folder2/a.jpg"), b"a").unwrap();
+        fs::write(root.join("domik/b.jpg"), b"b").unwrap();
 
         let report = process_inbox(&vault).unwrap();
         assert_eq!(report.files_imported, 2);
-        assert_eq!(report.collections_created, 3);
+        assert_eq!(report.collections_created, 2);
+        assert_eq!(count_collections(&vault), 2);
 
-        let conn = vault.connection();
-
-        let parent_id: String = conn
+        let tagged_parent: i32 = vault
+            .connection()
             .query_row(
-                "SELECT id FROM collection WHERE title = 'parent'",
+                "SELECT COUNT(DISTINCT c.id) FROM collection c
+                 JOIN entity_tag et ON et.entity_id = c.id
+                 JOIN tag t ON t.id = et.tag_id
+                 WHERE t.name = 'parent'",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
+        assert_eq!(tagged_parent, 2);
+    }
 
-        let child_collections: i32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM collection_member cm
-                 JOIN collection c ON c.id = cm.entity_id
-                 WHERE cm.collection_id = ?1",
-                [&parent_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(child_collections, 2);
+    #[test]
+    fn process_inbox_different_file_sets_do_not_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
 
-        let sub_a_files: i32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM collection_member cm
-                 JOIN collection c ON c.id = cm.collection_id
-                 WHERE c.title = 'folder a'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(sub_a_files, 1);
+        let first = vault.inbox_dir().join("album1");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("a.jpg"), b"a").unwrap();
+        process_inbox(&vault).unwrap();
 
-        let relative_path: String = conn
-            .query_row(
-                "SELECT value FROM metadata
-                 WHERE key = 'source_relative_path' AND value = 'parent/folder a/a.jpg'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(relative_path, "parent/folder a/a.jpg");
+        let second = vault.inbox_dir().join("album1");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("a.jpg"), b"a").unwrap();
+        fs::write(second.join("b.jpg"), b"b").unwrap();
+        let report = process_inbox(&vault).unwrap();
+
+        assert_eq!(report.collections_created, 1);
+        assert_eq!(count_collections(&vault), 2);
     }
 
     #[test]
@@ -422,43 +482,31 @@ mod tests {
     }
 
     #[test]
-    fn process_inbox_reuses_existing_album_by_source_path() {
+    fn process_inbox_reuses_existing_album_by_content_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let vault = Vault::init(dir.path()).unwrap();
 
-        let album = vault.inbox_dir().join("vacation");
-        fs::create_dir_all(&album).unwrap();
-        fs::write(album.join("a.jpg"), b"a").unwrap();
+        let first = vault.inbox_dir().join("sort/vacation");
+        fs::create_dir_all(&first).unwrap();
+        fs::write(first.join("a.jpg"), b"a").unwrap();
         process_inbox(&vault).unwrap();
 
-        fs::create_dir_all(vault.inbox_dir().join("vacation")).unwrap();
-        fs::write(vault.inbox_dir().join("vacation/b.jpg"), b"b").unwrap();
+        let second = vault.inbox_dir().join("vacation");
+        fs::create_dir_all(&second).unwrap();
+        fs::write(second.join("a.jpg"), b"a").unwrap();
         let report = process_inbox(&vault).unwrap();
 
         assert_eq!(report.collections_created, 0);
-        assert_eq!(report.files_imported, 1);
+        assert_eq!(count_collections(&vault), 1);
 
-        let album_count: i32 = vault
+        let collection_id: Uuid = vault
             .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM collection WHERE title = 'vacation'",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT id FROM collection LIMIT 1", [], |row| {
+                let id: String = row.get(0)?;
+                Ok(Uuid::parse_str(&id).unwrap())
+            })
             .unwrap();
-        assert_eq!(album_count, 1);
-
-        let member_count: i32 = vault
-            .connection()
-            .query_row(
-                "SELECT COUNT(*) FROM collection_member cm
-                 JOIN collection c ON c.id = cm.collection_id
-                 WHERE c.title = 'vacation'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(member_count, 2);
+        assert_eq!(count_source_refs_for_collection(&vault, collection_id), 2);
     }
 
     #[test]

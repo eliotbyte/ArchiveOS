@@ -28,6 +28,16 @@ pub fn migrate(conn: &Connection) -> Result<(), VaultError> {
             .map_err(db_err)?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![1, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 1 {
+        conn.execute_batch(include_str!("../../migrations/002_collection_fingerprint.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![DB_SCHEMA_VERSION, Utc::now().to_rfc3339()],
         )
         .map_err(db_err)?;
@@ -107,5 +117,19 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, DB_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrate_v2_adds_content_fingerprint_column() {
+        let conn = in_memory_conn();
+        migrate(&conn).unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('collection') WHERE name = 'content_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
