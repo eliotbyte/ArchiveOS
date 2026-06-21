@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
-use archiveos_contract::VaultError;
+use archiveos_contract::{MetadataEntry, VaultError};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
+
+use crate::metadata;
 
 #[derive(Debug, Clone)]
 pub struct EntityDetail {
@@ -15,6 +17,7 @@ pub struct EntityDetail {
     pub created_at: Option<String>,
     pub tags: Vec<String>,
     pub metadata: HashMap<String, String>,
+    pub metadata_entries: Vec<MetadataEntry>,
 }
 
 pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, VaultError> {
@@ -56,7 +59,8 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
     })?;
 
     let tags = crate::tags::list_entity_tags(conn, id)?;
-    let metadata = load_metadata(conn, id)?;
+    let metadata_entries = load_metadata_entries(conn, id)?;
+    let metadata = metadata::flatten_metadata(&metadata_entries);
 
     Ok(EntityDetail {
         id,
@@ -68,26 +72,31 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
         created_at,
         tags,
         metadata,
+        metadata_entries,
     })
 }
 
-fn load_metadata(
+fn load_metadata_entries(
     conn: &Connection,
     entity_id: Uuid,
-) -> Result<HashMap<String, String>, VaultError> {
+) -> Result<Vec<MetadataEntry>, VaultError> {
     let mut stmt = conn
-        .prepare("SELECT key, value FROM metadata WHERE entity_id = ?1")
+        .prepare("SELECT key, value, provenance FROM metadata WHERE entity_id = ?1")
         .map_err(db_err)?;
 
     let rows = stmt
         .query_map([entity_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(MetadataEntry {
+                key: row.get(0)?,
+                value: row.get(1)?,
+                provenance: row.get(2)?,
+            })
         })
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
 
-    Ok(rows.into_iter().collect())
+    Ok(rows)
 }
 
 fn db_err(err: rusqlite::Error) -> VaultError {
@@ -127,5 +136,53 @@ mod tests {
         let detail = get_entity(vault.connection(), entity_id).unwrap();
         assert_eq!(detail.tags, vec!["pic"]);
         assert!(detail.metadata.contains_key("path"));
+        assert!(!detail.metadata_entries.is_empty());
+    }
+
+    #[test]
+    fn get_entity_metadata_entries_include_provenance() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let entity_id = Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::import::db::insert_entity(
+            vault.connection(),
+            entity_id,
+            None,
+            None,
+            0,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+        crate::import::db::upsert_metadata(
+            vault.connection(),
+            entity_id,
+            "description",
+            "from yt",
+            "yt-dlp",
+        )
+        .unwrap();
+        crate::import::db::upsert_metadata(
+            vault.connection(),
+            entity_id,
+            "title",
+            "User Title",
+            "user",
+        )
+        .unwrap();
+        crate::import::db::upsert_metadata(
+            vault.connection(),
+            entity_id,
+            "title",
+            "YT Title",
+            "yt-dlp",
+        )
+        .unwrap();
+
+        let detail = get_entity(vault.connection(), entity_id).unwrap();
+        assert_eq!(detail.metadata.get("title").map(String::as_str), Some("User Title"));
+        assert_eq!(detail.metadata_entries.len(), 3);
     }
 }

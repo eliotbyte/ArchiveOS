@@ -2,6 +2,8 @@ use archiveos_contract::{EntityHit, SearchQuery, VaultError};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use uuid::Uuid;
 
+use crate::metadata;
+
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<EntityHit>, VaultError> {
     if query.tag.is_none() && query.text.is_none() {
         return Err(VaultError::InvalidLayout {
@@ -36,14 +38,20 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<EntityHit>, 
 }
 
 fn build_search_sql(query: &SearchQuery) -> String {
+    let hidden = if query.include_hidden {
+        String::new()
+    } else {
+        format!(" AND {}", metadata::hidden_entity_sql("e"))
+    };
+    let title_order = metadata::title_precedence_sql();
+
     match (&query.tag, &query.text) {
         (Some(_), Some(_)) => {
-            "SELECT DISTINCT e.id, e.content_hash, e.mime, (
+            format!(
+                "SELECT DISTINCT e.id, e.content_hash, e.mime, (
                 SELECT m.value FROM metadata m
                 WHERE m.entity_id = e.id AND m.key = 'title'
-                ORDER BY CASE m.provenance
-                    WHEN 'user' THEN 0 WHEN 'source' THEN 1
-                    WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 3 ELSE 4 END
+                ORDER BY {title_order}
                 LIMIT 1
              ) AS title
              FROM entity e
@@ -54,33 +62,31 @@ fn build_search_sql(query: &SearchQuery) -> String {
                  SELECT 1 FROM metadata m
                  WHERE m.entity_id = e.id
                    AND m.value LIKE '%' || ?2 || '%' ESCAPE '\\'
-               )
+               ){hidden}
              ORDER BY e.added_at DESC"
-                .to_string()
+            )
         }
         (Some(_), None) => {
-            "SELECT DISTINCT e.id, e.content_hash, e.mime, (
+            format!(
+                "SELECT DISTINCT e.id, e.content_hash, e.mime, (
                 SELECT m.value FROM metadata m
                 WHERE m.entity_id = e.id AND m.key = 'title'
-                ORDER BY CASE m.provenance
-                    WHEN 'user' THEN 0 WHEN 'source' THEN 1
-                    WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 3 ELSE 4 END
+                ORDER BY {title_order}
                 LIMIT 1
              ) AS title
              FROM entity e
              INNER JOIN entity_tag et ON et.entity_id = e.id
              INNER JOIN tag t ON t.id = et.tag_id
-             WHERE t.name = ?1
+             WHERE t.name = ?1{hidden}
              ORDER BY e.added_at DESC"
-                .to_string()
+            )
         }
         (None, Some(_)) => {
-            "SELECT DISTINCT e.id, e.content_hash, e.mime, (
+            format!(
+                "SELECT DISTINCT e.id, e.content_hash, e.mime, (
                 SELECT m.value FROM metadata m
                 WHERE m.entity_id = e.id AND m.key = 'title'
-                ORDER BY CASE m.provenance
-                    WHEN 'user' THEN 0 WHEN 'source' THEN 1
-                    WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 3 ELSE 4 END
+                ORDER BY {title_order}
                 LIMIT 1
              ) AS title
              FROM entity e
@@ -88,9 +94,9 @@ fn build_search_sql(query: &SearchQuery) -> String {
                  SELECT 1 FROM metadata m
                  WHERE m.entity_id = e.id
                    AND m.value LIKE '%' || ?1 || '%' ESCAPE '\\'
-             )
+             ){hidden}
              ORDER BY e.added_at DESC"
-                .to_string()
+            )
         }
         (None, None) => String::new(),
     }
@@ -118,13 +124,14 @@ fn load_tags(conn: &Connection, entity_id: Uuid) -> Result<Vec<String>, VaultErr
 }
 
 fn load_title(conn: &Connection, entity_id: Uuid) -> Result<Option<String>, VaultError> {
+    let title_order = metadata::title_precedence_sql();
     conn.query_row(
-        "SELECT value FROM metadata
+        &format!(
+            "SELECT value FROM metadata
          WHERE entity_id = ?1 AND key = 'title'
-         ORDER BY CASE provenance
-             WHEN 'user' THEN 0 WHEN 'source' THEN 1
-             WHEN 'extracted' THEN 2 WHEN 'inferred' THEN 3 ELSE 4 END
-         LIMIT 1",
+         ORDER BY {title_order}
+         LIMIT 1"
+        ),
         [entity_id.to_string()],
         |row| row.get(0),
     )
@@ -142,10 +149,13 @@ fn db_err(err: rusqlite::Error) -> VaultError {
 mod tests {
     use super::*;
     use crate::import::import;
+    use crate::import::db::{insert_entity, upsert_metadata};
     use crate::tags::add_tag;
     use archiveos_contract::ImportStrategy;
     use crate::Vault;
+    use chrono::Utc;
     use tempfile::tempdir;
+    use uuid::Uuid;
 
     fn vault_with_indexed_files() -> (tempfile::TempDir, Vault, Uuid, Uuid) {
         let dir = tempdir().unwrap();
@@ -227,10 +237,48 @@ mod tests {
             &SearchQuery {
                 tag: Some("animals".into()),
                 text: Some("Dog".into()),
+                include_hidden: false,
             },
         )
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, dog);
+    }
+
+    #[test]
+    fn search_hides_hidden_entities_by_default() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let conn = vault.connection();
+        let entity_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        insert_entity(conn, entity_id, Some("abc"), Some("image/webp"), 10, "present", &now, None)
+            .unwrap();
+        upsert_metadata(conn, entity_id, "title", "Hidden Thumb", "yt-dlp").unwrap();
+        upsert_metadata(conn, entity_id, "visibility", "hidden", "archiveos").unwrap();
+        add_tag(conn, entity_id, "gallery").unwrap();
+
+        let hidden = search(
+            conn,
+            &SearchQuery {
+                tag: Some("gallery".into()),
+                text: None,
+                include_hidden: false,
+            },
+        )
+        .unwrap();
+        assert!(hidden.is_empty());
+
+        let visible = search(
+            conn,
+            &SearchQuery {
+                tag: Some("gallery".into()),
+                text: None,
+                include_hidden: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id, entity_id);
     }
 }

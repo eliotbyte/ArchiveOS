@@ -12,3 +12,9 @@ CLAUDE.md
 # Local Docker overrides
 docker-compose.local.yml
 /vaults/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/

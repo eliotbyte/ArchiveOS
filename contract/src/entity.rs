@@ -10,10 +10,18 @@ pub struct EntityHit {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetadataEntry {
+    pub key: String,
+    pub value: String,
+    pub provenance: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SearchQuery {
     pub tag: Option<String>,
     pub text: Option<String>,
+    pub include_hidden: bool,
 }
 
 impl SearchQuery {
@@ -21,6 +29,7 @@ impl SearchQuery {
         Self {
             tag: Some(name.into()),
             text: None,
+            include_hidden: false,
         }
     }
 
@@ -28,6 +37,7 @@ impl SearchQuery {
         Self {
             tag: None,
             text: Some(query.into()),
+            include_hidden: false,
         }
     }
 }

@@ -49,20 +49,73 @@ pub fn create_job(
     Ok(job)
 }
 
-pub fn claim_job(conn: &Connection, lease_secs: i64) -> Result<Option<Job>, VaultError> {
+/// Requeue jobs whose lease expired while claimed/running.
+pub fn requeue_expired_jobs(conn: &Connection) -> Result<u32, VaultError> {
+    let now = Utc::now().to_rfc3339();
+    let changed = conn
+        .execute(
+            "UPDATE job SET status = 'pending', lease_until = NULL
+             WHERE status IN ('claimed', 'running')
+               AND lease_until IS NOT NULL
+               AND lease_until < ?1",
+            [now],
+        )
+        .map_err(db_err)?;
+    Ok(changed as u32)
+}
+
+pub fn claim_job(
+    conn: &Connection,
+    lease_secs: i64,
+    job_type: Option<&str>,
+) -> Result<Option<Job>, VaultError> {
+    requeue_expired_jobs(conn)?;
     let lease_until = (Utc::now() + Duration::seconds(lease_secs)).to_rfc3339();
 
-    conn.query_row(
-        "UPDATE job SET status = 'claimed', lease_until = ?1, attempts = attempts + 1
-         WHERE id = (
-           SELECT id FROM job WHERE status = 'pending' ORDER BY created_at LIMIT 1
-         )
-         RETURNING id, type, target_vault, input, status, lease_until, attempts, created_at",
-        [lease_until],
-        map_job,
-    )
-    .optional()
-    .map_err(db_err)
+    let job = if let Some(job_type) = job_type {
+        conn.query_row(
+            "UPDATE job SET status = 'running', lease_until = ?1, attempts = attempts + 1
+             WHERE id = (
+               SELECT id FROM job
+               WHERE status = 'pending' AND type = ?2
+               ORDER BY created_at LIMIT 1
+             )
+             RETURNING id, type, target_vault, input, status, lease_until, attempts, created_at",
+            params![lease_until, job_type],
+            map_job,
+        )
+        .optional()
+        .map_err(db_err)?
+    } else {
+        conn.query_row(
+            "UPDATE job SET status = 'running', lease_until = ?1, attempts = attempts + 1
+             WHERE id = (
+               SELECT id FROM job WHERE status = 'pending' ORDER BY created_at LIMIT 1
+             )
+             RETURNING id, type, target_vault, input, status, lease_until, attempts, created_at",
+            [lease_until],
+            map_job,
+        )
+        .optional()
+        .map_err(db_err)?
+    };
+
+    Ok(job)
+}
+
+pub fn heartbeat_job(conn: &Connection, job_id: Uuid, lease_secs: i64) -> Result<(), VaultError> {
+    let lease_until = (Utc::now() + Duration::seconds(lease_secs)).to_rfc3339();
+    let changed = conn
+        .execute(
+            "UPDATE job SET lease_until = ?1
+             WHERE id = ?2 AND status IN ('claimed', 'running')",
+            params![lease_until, job_id.to_string()],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(VaultError::NotFound);
+    }
+    Ok(())
 }
 
 pub fn get_job(conn: &Connection, job_id: Uuid) -> Result<Option<Job>, VaultError> {
@@ -114,6 +167,7 @@ fn db_err(err: rusqlite::Error) -> VaultError {
 mod tests {
     use super::*;
     use crate::Vault;
+    use chrono::{Duration, Utc};
     use tempfile::tempdir;
 
     #[test]
@@ -125,11 +179,68 @@ mod tests {
         let job = create_job(conn, "scan", "test", "/photos").unwrap();
         assert_eq!(job.status, "pending");
 
-        let claimed = claim_job(conn, 300).unwrap().expect("claimed job");
+        let claimed = claim_job(conn, 300, None).unwrap().expect("claimed job");
         assert_eq!(claimed.id, job.id);
-        assert_eq!(claimed.status, "claimed");
+        assert_eq!(claimed.status, "running");
         assert!(claimed.lease_until.is_some());
 
-        assert!(claim_job(conn, 300).unwrap().is_none());
+        assert!(claim_job(conn, 300, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn claim_by_type_skips_other_jobs() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let scan = create_job(conn, "scan", "test", "/photos").unwrap();
+        let yt = create_job(conn, "yt-dlp", "test", "https://youtube.com/watch?v=x").unwrap();
+
+        let claimed = claim_job(conn, 300, Some("yt-dlp"))
+            .unwrap()
+            .expect("yt job");
+        assert_eq!(claimed.id, yt.id);
+        assert_ne!(claimed.id, scan.id);
+
+        let scan_claimed = claim_job(conn, 300, None).unwrap().expect("scan job");
+        assert_eq!(scan_claimed.id, scan.id);
+    }
+
+    #[test]
+    fn heartbeat_extends_lease() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let job = create_job(conn, "yt-dlp", "test", "url").unwrap();
+        claim_job(conn, 60, None).unwrap();
+
+        heartbeat_job(conn, job.id, 600).unwrap();
+        let updated = get_job(conn, job.id).unwrap().unwrap();
+        let lease = updated.lease_until.unwrap();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&lease).unwrap();
+        assert!(parsed > Utc::now() + Duration::seconds(500));
+    }
+
+    #[test]
+    fn expired_lease_requeued_on_claim() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let job = create_job(conn, "yt-dlp", "test", "url").unwrap();
+        let past = (Utc::now() - Duration::seconds(60)).to_rfc3339();
+        conn.execute(
+            "UPDATE job SET status = 'running', lease_until = ?1, attempts = 1 WHERE id = ?2",
+            params![past, job.id.to_string()],
+        )
+        .unwrap();
+
+        requeue_expired_jobs(conn).unwrap();
+        let reclaimed = claim_job(conn, 300, Some("yt-dlp"))
+            .unwrap()
+            .expect("reclaimed");
+        assert_eq!(reclaimed.id, job.id);
+        assert_eq!(reclaimed.status, "running");
     }
 }

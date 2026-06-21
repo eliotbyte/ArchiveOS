@@ -303,6 +303,26 @@ pub fn link_collection_member_direct(
     Ok(true)
 }
 
+pub fn link_entity_relation(
+    conn: &Connection,
+    from_entity_id: Uuid,
+    to_entity_id: Uuid,
+    relation: &str,
+) -> Result<(), VaultError> {
+    conn.execute(
+        "INSERT INTO entity_relation (from_entity_id, to_entity_id, relation)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(from_entity_id, to_entity_id, relation) DO NOTHING",
+        params![
+            from_entity_id.to_string(),
+            to_entity_id.to_string(),
+            relation,
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 fn db_err(err: rusqlite::Error) -> VaultError {
     VaultError::Database {
         detail: err.to_string(),

@@ -38,6 +38,26 @@ pub fn migrate(conn: &Connection) -> Result<(), VaultError> {
             .map_err(db_err)?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![2, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 2 {
+        conn.execute_batch(include_str!("../../migrations/003_ytdlp_pipeline.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![3, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 3 {
+        conn.execute_batch(include_str!("../../migrations/004_entity_roles_provenance.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![DB_SCHEMA_VERSION, Utc::now().to_rfc3339()],
         )
         .map_err(db_err)?;
@@ -97,6 +117,9 @@ mod tests {
             "collection",
             "collection_member",
             "job",
+            "source_failure",
+            "source_subscription",
+            "entity_relation",
             "schema_migrations",
         ] {
             assert!(table_exists(&conn, table).unwrap(), "missing table {table}");

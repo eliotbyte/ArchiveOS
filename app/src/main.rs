@@ -150,7 +150,11 @@ fn main() -> Result<()> {
             let vault = open_vault_ref(Some(&registry), &vault)
                 .context("failed to open vault")?;
             let hits = vault
-                .search(&SearchQuery { tag, text: query })
+                .search(&SearchQuery {
+                    tag,
+                    text: query,
+                    include_hidden: false,
+                })
                 .context("search failed")?;
             for hit in hits {
                 let tags = hit.tags.join(",");

@@ -8,9 +8,9 @@ pub mod registry;
 pub use constants::*;
 pub use error::VaultError;
 pub use import::{
-    ImportManifest, ImportReport, ImportStrategy, ManifestCollection, ManifestItem,
-    ManifestMembership, ManifestSourceRef,
+    ImportManifest, ImportReport, ImportStrategy, ManifestChannel, ManifestCollection, ManifestItem,
+    ManifestMembership, ManifestRelation, ManifestSourceRef,
 };
 pub use metadata::VaultMetadata;
 pub use registry::{VaultRegistryEntry, VaultStatus};
-pub use entity::{EntityHit, SearchQuery};
+pub use entity::{EntityHit, MetadataEntry, SearchQuery};

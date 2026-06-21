@@ -9,3 +9,19 @@ services:
     environment:
       ARCHIVEOS_CONFIG: /config
       ARCHIVEOS_LISTEN: 0.0.0.0:8080
+
+  ytdlp-worker:
+    build: ./worker-ytdlp
+    depends_on:
+      - core
+    volumes:
+      - ${VAULT_PATH:-./vaults/default}:/vaults/default
+    environment:
+      CORE_URL: http://core:8080
+      VAULT_NAME: default
+      VAULT_PATH: /vaults/default
+      YTDLP_UPDATE_ON_START: "1"
+      YTDLP_AUTO_UPDATE: "1"
+      YTDLP_UPDATE_INTERVAL_SECS: "86400"
+      JOB_POLL_SECS: "5"
+      JOB_LEASE_SECS: "600"

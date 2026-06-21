@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use archiveos_contract::{
-    ImportManifest, ImportReport, ImportStrategy, ManifestItem, ManifestSourceRef, VaultError,
+    ImportManifest, ImportReport, ImportStrategy, ManifestChannel, ManifestItem, ManifestRelation,
+    ManifestSourceRef, VaultError,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -44,6 +45,10 @@ fn import_from_manifest(
     strategy: ImportStrategy,
     report: &mut ImportReport,
 ) -> Result<(), VaultError> {
+    for channel in &manifest.channels {
+        import_channel(conn, channel)?;
+    }
+
     if let Some(collection) = &manifest.collection {
         report.collection_id = Some(import_collection(
             conn,
@@ -57,7 +62,7 @@ fn import_from_manifest(
             report.items_skipped += 1;
             continue;
         }
-        import_manifest_item(vault, conn, staging_dir, item, strategy, report)?;
+        import_manifest_item(vault, conn, staging_dir, item, strategy, &manifest.source, report)?;
     }
 
     if let Some(collection_id) = report.collection_id {
@@ -82,6 +87,74 @@ fn import_from_manifest(
         }
     }
 
+    for relation in &manifest.relations {
+        import_relation(conn, relation)?;
+    }
+
+    Ok(())
+}
+
+fn import_channel(conn: &Connection, channel: &ManifestChannel) -> Result<Uuid, VaultError> {
+    let entity_id = if let Some(existing) =
+        db::find_entity_by_source_ref(conn, &channel.source, &channel.kind, &channel.external_id)?
+    {
+        existing
+    } else {
+        let id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        db::insert_entity(conn, id, None, None, 0, "present", &now, None)?;
+        db::insert_source_ref(
+            conn,
+            Uuid::new_v4(),
+            id,
+            &channel.source,
+            &channel.kind,
+            &channel.external_id,
+            channel.url.as_deref(),
+            "live",
+        )?;
+        id
+    };
+
+    if let Some(metadata) = &channel.metadata {
+        ingest_metadata_legacy(conn, entity_id, metadata)?;
+    }
+
+    Ok(entity_id)
+}
+
+fn import_relation(conn: &Connection, relation: &ManifestRelation) -> Result<(), VaultError> {
+    let Some(from_id) = db::find_entity_by_source_ref(
+        conn,
+        &relation.source,
+        &relation.from_kind,
+        &relation.from_external_id,
+    )?
+    else {
+        return Ok(());
+    };
+    let Some(to_id) = db::find_entity_by_source_ref(
+        conn,
+        &relation.source,
+        &relation.to_kind,
+        &relation.to_external_id,
+    )?
+    else {
+        return Ok(());
+    };
+
+    db::link_entity_relation(conn, from_id, to_id, &relation.relation)?;
+
+    if relation.relation == "thumbnail" {
+        db::upsert_metadata(
+            conn,
+            from_id,
+            "thumbnail_external_id",
+            &relation.to_external_id,
+            "archiveos",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -90,6 +163,15 @@ fn import_collection(
     collection: &archiveos_contract::ManifestCollection,
     manifest_source: &str,
 ) -> Result<Uuid, VaultError> {
+    if let Some(existing) = db::find_entity_by_source_ref(
+        conn,
+        manifest_source,
+        "playlist",
+        &collection.external_id,
+    )? {
+        return Ok(existing);
+    }
+
     let id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
 
@@ -126,6 +208,7 @@ fn import_manifest_item(
     staging_dir: &Path,
     item: &ManifestItem,
     strategy: ImportStrategy,
+    manifest_source: &str,
     report: &mut ImportReport,
 ) -> Result<(), VaultError> {
     let file_path = resolve_item_path(staging_dir, &item.path, strategy)?;
@@ -187,8 +270,11 @@ fn import_manifest_item(
     }
 
     if let Some(metadata) = &item.metadata {
-        ingest_metadata(conn, entity_id, metadata)?;
+        let default_provenance = default_metadata_provenance(manifest_source);
+        ingest_metadata(conn, entity_id, metadata, default_provenance)?;
     }
+
+    ingest_metadata_by_provenance(conn, entity_id, &item.metadata_by_provenance)?;
 
     crate::media::image::persist(conn, entity_id, &image_meta, modified_at.as_deref())?;
 
@@ -299,15 +385,52 @@ fn resolve_item_path(
     Ok(resolved)
 }
 
-fn ingest_metadata(conn: &Connection, entity_id: Uuid, metadata: &Value) -> Result<(), VaultError> {
+fn default_metadata_provenance(manifest_source: &str) -> &'static str {
+    if manifest_source == "yt-dlp" {
+        "yt-dlp"
+    } else {
+        "source"
+    }
+}
+
+fn ingest_metadata(
+    conn: &Connection,
+    entity_id: Uuid,
+    metadata: &Value,
+    provenance: &str,
+) -> Result<(), VaultError> {
+    ingest_metadata_map(conn, entity_id, metadata, provenance)
+}
+
+fn ingest_metadata_by_provenance(
+    conn: &Connection,
+    entity_id: Uuid,
+    groups: &std::collections::BTreeMap<String, Value>,
+) -> Result<(), VaultError> {
+    for (provenance, metadata) in groups {
+        ingest_metadata_map(conn, entity_id, metadata, provenance)?;
+    }
+    Ok(())
+}
+
+fn ingest_metadata_map(
+    conn: &Connection,
+    entity_id: Uuid,
+    metadata: &Value,
+    provenance: &str,
+) -> Result<(), VaultError> {
     let Some(map) = metadata.as_object() else {
         return Ok(());
     };
 
     for (key, value) in map {
-        db::upsert_metadata(conn, entity_id, key, &value_to_string(value), "source")?;
+        db::upsert_metadata(conn, entity_id, key, &value_to_string(value), provenance)?;
     }
     Ok(())
+}
+
+fn ingest_metadata_legacy(conn: &Connection, entity_id: Uuid, metadata: &Value) -> Result<(), VaultError> {
+    ingest_metadata(conn, entity_id, metadata, "source")
 }
 
 fn value_to_string(value: &Value) -> String {
@@ -378,8 +501,11 @@ mod tests {
                     "title": "Test Video",
                     "duration": 120
                 })),
+                metadata_by_provenance: Default::default(),
             }],
             membership: vec![],
+            channels: vec![],
+            relations: vec![],
         }
     }
 
@@ -486,8 +612,11 @@ mod tests {
                 status: "complete".into(),
                 source_ref: None,
                 metadata: None,
+                metadata_by_provenance: Default::default(),
             }],
             membership: vec![],
+            channels: vec![],
+            relations: vec![],
         };
 
         import(
@@ -592,5 +721,354 @@ mod tests {
             )
             .unwrap();
         assert_eq!(members, 2);
+    }
+
+    #[test]
+    fn import_collection_reuses_existing_playlist_source_ref() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+
+        let staging0 = dir.path().join("staging/job-0");
+        let file0 = staging0.join("files/v0.mp4");
+        fs::create_dir_all(file0.parent().unwrap()).unwrap();
+        fs::write(&file0, b"v0").unwrap();
+        let mut manifest0 = sample_manifest("files/v0.mp4");
+        manifest0.items[0].source_ref.as_mut().unwrap().external_id = "ext-0".into();
+        manifest0.collection = Some(ManifestCollection {
+            collection_type: "youtube_playlist".into(),
+            external_id: "PL123".into(),
+            url: "https://youtube.com/playlist?list=PL123".into(),
+            title: "My List".into(),
+        });
+        manifest0.membership = vec![archiveos_contract::ManifestMembership {
+            external_id: "ext-0".into(),
+            position: 0,
+        }];
+        let report0 = import(
+            &vault,
+            &staging0,
+            Some(&manifest0),
+            ImportStrategy::Managed,
+        )
+        .unwrap();
+        let collection_id = report0.collection_id.unwrap();
+
+        let staging1 = dir.path().join("staging/job-1");
+        fs::create_dir_all(&staging1).unwrap();
+        let mut manifest1 = sample_manifest("files/missing.mp4");
+        manifest1.items.clear();
+        manifest1.collection = Some(ManifestCollection {
+            collection_type: "youtube_playlist".into(),
+            external_id: "PL123".into(),
+            url: "https://youtube.com/playlist?list=PL123".into(),
+            title: "My List".into(),
+        });
+        manifest1.membership = vec![archiveos_contract::ManifestMembership {
+            external_id: "ext-0".into(),
+            position: 0,
+        }];
+
+        let report1 = import(
+            &vault,
+            &staging1,
+            Some(&manifest1),
+            ImportStrategy::Managed,
+        )
+        .unwrap();
+
+        assert_eq!(report1.collection_id, Some(collection_id));
+
+        let playlist_entities: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM source_ref WHERE kind = 'playlist' AND external_id = 'PL123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(playlist_entities, 1);
+    }
+
+    #[test]
+    fn import_channel_and_uploaded_by_relation() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let staging = dir.path().join("staging/job-1");
+        let file = staging.join("files/video.mp4");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"video-content").unwrap();
+
+        let mut manifest = sample_manifest("files/video.mp4");
+        manifest.channels.push(ManifestChannel {
+            source: "youtube".into(),
+            kind: "channel".into(),
+            external_id: "UC123".into(),
+            url: Some("https://youtube.com/channel/UC123".into()),
+            metadata: Some(serde_json::json!({
+                "title": "Test Channel",
+                "verified": true
+            })),
+        });
+        manifest.relations.push(ManifestRelation {
+            source: "youtube".into(),
+            from_kind: "video".into(),
+            from_external_id: "vid123".into(),
+            to_kind: "channel".into(),
+            to_external_id: "UC123".into(),
+            relation: "uploaded_by".into(),
+        });
+
+        import(
+            &vault,
+            &staging,
+            Some(&manifest),
+            ImportStrategy::Managed,
+        )
+        .unwrap();
+
+        let channel_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM source_ref WHERE kind = 'channel' AND external_id = 'UC123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(channel_count, 1);
+
+        let relation_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM entity_relation WHERE relation = 'uploaded_by'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relation_count, 1);
+    }
+
+    #[test]
+    fn import_video_and_thumbnail_relation() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let staging = dir.path().join("staging/job-1");
+        let video = staging.join("files/video.mp4");
+        let thumb = staging.join("files/vid123.webp");
+        fs::create_dir_all(video.parent().unwrap()).unwrap();
+        fs::write(&video, b"video-content").unwrap();
+        fs::write(&thumb, b"webp-thumb").unwrap();
+
+        let manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![],
+            items: vec![
+                ManifestItem {
+                    path: "files/video.mp4".into(),
+                    sha256: None,
+                    status: "complete".into(),
+                    source_ref: Some(ManifestSourceRef {
+                        source: "youtube".into(),
+                        kind: "video".into(),
+                        external_id: "vid123".into(),
+                        url: Some("https://example.com/watch?v=vid123".into()),
+                    }),
+                    metadata: Some(serde_json::json!({
+                        "title": "Test Video",
+                        "thumbnail_external_id": "vid123:thumbnail"
+                    })),
+                    metadata_by_provenance: {
+                        let mut map = std::collections::BTreeMap::new();
+                        map.insert(
+                            "yt-dlp".into(),
+                            serde_json::json!({
+                                "title": "Test Video",
+                                "description": "From YouTube"
+                            }),
+                        );
+                        map.insert(
+                            "ffprobe".into(),
+                            serde_json::json!({
+                                "actual_height": 1080,
+                                "video_codec": "h264"
+                            }),
+                        );
+                        map.insert(
+                            "archiveos".into(),
+                            serde_json::json!({
+                                "thumbnail_external_id": "vid123:thumbnail"
+                            }),
+                        );
+                        map
+                    },
+                },
+                ManifestItem {
+                    path: "files/vid123.webp".into(),
+                    sha256: None,
+                    status: "complete".into(),
+                    source_ref: Some(ManifestSourceRef {
+                        source: "youtube".into(),
+                        kind: "thumbnail".into(),
+                        external_id: "vid123:thumbnail".into(),
+                        url: Some("https://example.com/thumb.webp".into()),
+                    }),
+                    metadata: Some(serde_json::json!({
+                        "title": "Test Video thumbnail",
+                        "thumbnail_for": "vid123"
+                    })),
+                    metadata_by_provenance: {
+                        let mut map = std::collections::BTreeMap::new();
+                        map.insert(
+                            "archiveos".into(),
+                            serde_json::json!({
+                                "entity_role": "supporting",
+                                "asset_role": "thumbnail",
+                                "visibility": "hidden",
+                                "thumbnail_for": "vid123"
+                            }),
+                        );
+                        map
+                    },
+                },
+            ],
+            membership: vec![],
+            relations: vec![ManifestRelation {
+                source: "youtube".into(),
+                from_kind: "video".into(),
+                from_external_id: "vid123".into(),
+                to_kind: "thumbnail".into(),
+                to_external_id: "vid123:thumbnail".into(),
+                relation: "thumbnail".into(),
+            }],
+        };
+
+        import(
+            &vault,
+            &staging,
+            Some(&manifest),
+            ImportStrategy::Managed,
+        )
+        .unwrap();
+
+        let video_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM source_ref WHERE kind = 'video' AND external_id = 'vid123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(video_count, 1);
+
+        let thumb_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM source_ref WHERE kind = 'thumbnail' AND external_id = 'vid123:thumbnail'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thumb_count, 1);
+
+        let relation_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM entity_relation WHERE relation = 'thumbnail'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relation_count, 1);
+
+        let thumb_ref: String = vault
+            .connection()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'thumbnail_external_id' AND provenance = 'archiveos'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(thumb_ref, "vid123:thumbnail");
+
+        let hidden: String = vault
+            .connection()
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'visibility' AND provenance = 'archiveos'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(hidden, "hidden");
+
+        let codec_prov: String = vault
+            .connection()
+            .query_row(
+                "SELECT provenance FROM metadata WHERE key = 'video_codec'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codec_prov, "ffprobe");
+    }
+
+    #[test]
+    fn import_metadata_by_provenance_writes_explicit_labels() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let staging = dir.path().join("staging/job-1");
+        let file = staging.join("files/video.mp4");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"video-content").unwrap();
+
+        let mut groups = std::collections::BTreeMap::new();
+        groups.insert("ffprobe".into(), serde_json::json!({ "actual_height": 720 }));
+        groups.insert("archiveos".into(), serde_json::json!({ "thumbnail_external_id": "vid:thumbnail" }));
+
+        let manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![],
+            items: vec![ManifestItem {
+                path: "files/video.mp4".into(),
+                sha256: None,
+                status: "complete".into(),
+                source_ref: Some(ManifestSourceRef {
+                    source: "youtube".into(),
+                    kind: "video".into(),
+                    external_id: "vid".into(),
+                    url: None,
+                }),
+                metadata: Some(serde_json::json!({ "title": "Legacy" })),
+                metadata_by_provenance: groups,
+            }],
+            membership: vec![],
+            relations: vec![],
+        };
+
+        import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+
+        let title_prov: String = vault
+            .connection()
+            .query_row(
+                "SELECT provenance FROM metadata WHERE key = 'title'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title_prov, "yt-dlp");
+
+        let height_prov: String = vault
+            .connection()
+            .query_row(
+                "SELECT provenance FROM metadata WHERE key = 'actual_height'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(height_prov, "ffprobe");
     }
 }

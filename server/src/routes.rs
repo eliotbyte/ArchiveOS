@@ -25,8 +25,12 @@ pub fn router() -> Router<Arc<AppState>> {
         )
         .route("/vaults/{vault}/jobs", post(create_job))
         .route("/vaults/{vault}/jobs/claim", post(claim_job))
+        .route("/vaults/{vault}/jobs/{id}/heartbeat", post(heartbeat_job))
         .route("/vaults/{vault}/jobs/{id}/manifest", post(submit_manifest))
         .route("/vaults/{vault}/sources/has", get(sources_has))
+        .route("/vaults/{vault}/source-failures", get(list_source_failures).post(record_source_failure))
+        .route("/vaults/{vault}/subscriptions", get(list_subscriptions).post(create_subscription))
+        .route("/vaults/{vault}/subscriptions/{id}", delete(delete_subscription))
 }
 
 async fn health() -> &'static str {
@@ -100,6 +104,7 @@ struct EntityDetailResponse {
     created_at: Option<String>,
     tags: Vec<String>,
     metadata: std::collections::HashMap<String, String>,
+    metadata_entries: Vec<archiveos_contract::MetadataEntry>,
 }
 
 impl From<archiveos_core::entity::EntityDetail> for EntityDetailResponse {
@@ -114,6 +119,7 @@ impl From<archiveos_core::entity::EntityDetail> for EntityDetailResponse {
             created_at: d.created_at,
             tags: d.tags,
             metadata: d.metadata,
+            metadata_entries: d.metadata_entries,
         }
     }
 }
@@ -122,6 +128,8 @@ impl From<archiveos_core::entity::EntityDetail> for EntityDetailResponse {
 struct SearchParams {
     tag: Option<String>,
     query: Option<String>,
+    #[serde(default)]
+    include_hidden: bool,
 }
 
 async fn search_entities(
@@ -133,6 +141,7 @@ async fn search_entities(
     let hits = vault.search(&SearchQuery {
         tag: params.tag,
         text: params.query,
+        include_hidden: params.include_hidden,
     })?;
     Ok(Json(hits))
 }
@@ -210,6 +219,8 @@ impl From<archiveos_core::jobs::Job> for JobResponse {
 struct ClaimJobRequest {
     #[serde(default = "default_lease")]
     lease_secs: i64,
+    #[serde(rename = "type")]
+    job_type: Option<String>,
 }
 
 fn default_lease() -> i64 {
@@ -222,15 +233,65 @@ async fn claim_job(
     body: Option<Json<ClaimJobRequest>>,
 ) -> ApiResult<Json<Option<JobResponse>>> {
     let vault = open_vault(&state, &vault_name)?;
-    let lease_secs = body.map(|b| b.lease_secs).unwrap_or_else(default_lease);
-    let job = vault.claim_job(lease_secs)?;
+    let (lease_secs, job_type) = body
+        .map(|b| (b.lease_secs, b.job_type.clone()))
+        .unwrap_or_else(|| (default_lease(), None));
+    let job = vault.claim_job(lease_secs, job_type.as_deref())?;
     Ok(Json(job.map(JobResponse::from)))
+}
+
+#[derive(Deserialize)]
+struct HeartbeatJobRequest {
+    #[serde(default = "default_lease")]
+    lease_secs: i64,
+}
+
+async fn heartbeat_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+    body: Option<Json<HeartbeatJobRequest>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let lease_secs = body.map(|b| b.lease_secs).unwrap_or_else(default_lease);
+    vault.heartbeat_job(job_id, lease_secs)?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct SubmitManifestRequest {
+    #[serde(flatten)]
+    manifest: ImportManifest,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+fn resolve_job_status(manifest: &ImportManifest, explicit: Option<&str>) -> String {
+    if let Some(status) = explicit {
+        return match status {
+            "done" | "partial" | "failed" => status.to_string(),
+            _ => "done".to_string(),
+        };
+    }
+
+    let complete = manifest.items.iter().filter(|i| i.status == "complete").count();
+    let failed = manifest
+        .items
+        .iter()
+        .filter(|i| i.status == "failed")
+        .count();
+    if failed > 0 && complete > 0 {
+        "partial".to_string()
+    } else if failed > 0 && complete == 0 {
+        "failed".to_string()
+    } else {
+        "done".to_string()
+    }
 }
 
 async fn submit_manifest(
     State(state): State<Arc<AppState>>,
     Path((vault_name, job_id)): Path<(String, Uuid)>,
-    Json(manifest): Json<ImportManifest>,
+    Json(body): Json<SubmitManifestRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let vault = open_vault(&state, &vault_name)?;
     let job = vault.get_job(job_id)?;
@@ -239,14 +300,17 @@ async fn submit_manifest(
     }
 
     let staging = vault.staging_job_dir(&job_id.to_string());
-    let report = vault.import(&staging, Some(&manifest), ImportStrategy::Managed)?;
-    vault.finish_job(job_id, "done")?;
+    let report = vault.import(&staging, Some(&body.manifest), ImportStrategy::Managed)?;
+    let final_status = resolve_job_status(&body.manifest, body.status.as_deref());
+    vault.finish_job(job_id, &final_status)?;
 
     Ok(Json(serde_json::json!({
         "job_id": job_id,
+        "status": final_status,
         "entities_created": report.entities_created,
         "entities_reused": report.entities_reused,
         "blobs_stored": report.blobs_stored,
+        "items_skipped": report.items_skipped,
     })))
 }
 
@@ -287,4 +351,166 @@ struct SourceHasResponse {
     external_id: String,
     entity_id: String,
     present: bool,
+}
+
+#[derive(Deserialize)]
+struct RecordSourceFailureRequest {
+    #[serde(default)]
+    job_id: Option<Uuid>,
+    pub source: String,
+    pub kind: String,
+    pub external_id: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub stage: String,
+    pub error_kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+#[derive(Serialize)]
+struct SourceFailureResponse {
+    id: Uuid,
+    job_id: Option<Uuid>,
+    source: String,
+    kind: String,
+    external_id: String,
+    url: Option<String>,
+    stage: String,
+    error_kind: String,
+    message: String,
+    retryable: bool,
+    attempts: i32,
+    last_seen_at: String,
+    created_at: String,
+}
+
+impl From<archiveos_core::failures::SourceFailure> for SourceFailureResponse {
+    fn from(f: archiveos_core::failures::SourceFailure) -> Self {
+        Self {
+            id: f.id,
+            job_id: f.job_id,
+            source: f.source,
+            kind: f.kind,
+            external_id: f.external_id,
+            url: f.url,
+            stage: f.stage,
+            error_kind: f.error_kind,
+            message: f.message,
+            retryable: f.retryable,
+            attempts: f.attempts,
+            last_seen_at: f.last_seen_at,
+            created_at: f.created_at,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ListSourceFailuresParams {
+    source: Option<String>,
+    kind: Option<String>,
+}
+
+async fn record_source_failure(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Json(body): Json<RecordSourceFailureRequest>,
+) -> ApiResult<Json<SourceFailureResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let failure = vault.record_source_failure(&archiveos_core::failures::RecordFailureInput {
+        job_id: body.job_id,
+        source: body.source,
+        kind: body.kind,
+        external_id: body.external_id,
+        url: body.url,
+        stage: body.stage,
+        error_kind: body.error_kind,
+        message: body.message,
+        retryable: body.retryable,
+    })?;
+    Ok(Json(SourceFailureResponse::from(failure)))
+}
+
+async fn list_source_failures(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Query(params): Query<ListSourceFailuresParams>,
+) -> ApiResult<Json<Vec<SourceFailureResponse>>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let failures = vault.list_source_failures(params.source.as_deref(), params.kind.as_deref())?;
+    Ok(Json(failures.into_iter().map(SourceFailureResponse::from).collect()))
+}
+
+#[derive(Deserialize)]
+struct CreateSubscriptionRequest {
+    pub source: String,
+    pub kind: String,
+    pub url: String,
+    pub interval_minutes: i32,
+}
+
+#[derive(Serialize)]
+struct SubscriptionResponse {
+    id: Uuid,
+    source: String,
+    kind: String,
+    url: String,
+    target_vault: String,
+    interval_minutes: i32,
+    next_run_at: String,
+    last_checked_at: Option<String>,
+    status: String,
+    created_at: String,
+}
+
+impl From<archiveos_core::subscriptions::SourceSubscription> for SubscriptionResponse {
+    fn from(s: archiveos_core::subscriptions::SourceSubscription) -> Self {
+        Self {
+            id: s.id,
+            source: s.source,
+            kind: s.kind,
+            url: s.url,
+            target_vault: s.target_vault,
+            interval_minutes: s.interval_minutes,
+            next_run_at: s.next_run_at,
+            last_checked_at: s.last_checked_at,
+            status: s.status,
+            created_at: s.created_at,
+        }
+    }
+}
+
+async fn create_subscription(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Json(body): Json<CreateSubscriptionRequest>,
+) -> ApiResult<Json<SubscriptionResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let sub = vault.create_subscription(&archiveos_core::subscriptions::CreateSubscriptionInput {
+        source: body.source,
+        kind: body.kind,
+        url: body.url,
+        target_vault: vault_name,
+        interval_minutes: body.interval_minutes,
+    })?;
+    Ok(Json(SubscriptionResponse::from(sub)))
+}
+
+async fn list_subscriptions(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+) -> ApiResult<Json<Vec<SubscriptionResponse>>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let subs = vault.list_subscriptions()?;
+    Ok(Json(subs.into_iter().map(SubscriptionResponse::from).collect()))
+}
+
+async fn delete_subscription(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.delete_subscription(id)?;
+    Ok(Json(serde_json::json!({ "removed": id })))
 }

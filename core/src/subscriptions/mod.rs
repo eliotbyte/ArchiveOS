@@ -1,0 +1,209 @@
+use archiveos_contract::VaultError;
+use chrono::{Duration, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
+use uuid::Uuid;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSubscription {
+    pub id: Uuid,
+    pub source: String,
+    pub kind: String,
+    pub url: String,
+    pub target_vault: String,
+    pub interval_minutes: i32,
+    pub next_run_at: String,
+    pub last_checked_at: Option<String>,
+    pub status: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateSubscriptionInput {
+    pub source: String,
+    pub kind: String,
+    pub url: String,
+    pub target_vault: String,
+    pub interval_minutes: i32,
+}
+
+pub fn create_subscription(
+    conn: &Connection,
+    input: &CreateSubscriptionInput,
+) -> Result<SourceSubscription, VaultError> {
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let created_at = now.to_rfc3339();
+    let next_run_at = now.to_rfc3339();
+
+    conn.execute(
+        "INSERT INTO source_subscription (
+            id, source, kind, url, target_vault, interval_minutes,
+            next_run_at, last_checked_at, status, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'active', ?8)",
+        params![
+            id.to_string(),
+            input.source,
+            input.kind,
+            input.url,
+            input.target_vault,
+            input.interval_minutes,
+            next_run_at,
+            created_at,
+        ],
+    )
+    .map_err(db_err)?;
+
+    get_subscription(conn, id)?.ok_or(VaultError::NotFound)
+}
+
+pub fn list_subscriptions(conn: &Connection) -> Result<Vec<SourceSubscription>, VaultError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, source, kind, url, target_vault, interval_minutes,
+                    next_run_at, last_checked_at, status, created_at
+             FROM source_subscription
+             ORDER BY created_at DESC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt.query_map([], map_subscription).map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+pub fn delete_subscription(conn: &Connection, id: Uuid) -> Result<(), VaultError> {
+    let changed = conn
+        .execute("DELETE FROM source_subscription WHERE id = ?1", [id.to_string()])
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(VaultError::NotFound);
+    }
+    Ok(())
+}
+
+pub fn due_subscriptions(conn: &Connection) -> Result<Vec<SourceSubscription>, VaultError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, source, kind, url, target_vault, interval_minutes,
+                    next_run_at, last_checked_at, status, created_at
+             FROM source_subscription
+             WHERE status = 'active' AND next_run_at <= ?1
+             ORDER BY next_run_at ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([now], map_subscription)
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+pub fn mark_subscription_checked(
+    conn: &Connection,
+    id: Uuid,
+    interval_minutes: i32,
+) -> Result<(), VaultError> {
+    let now = Utc::now();
+    let next = (now + Duration::minutes(i64::from(interval_minutes))).to_rfc3339();
+    let changed = conn
+        .execute(
+            "UPDATE source_subscription
+             SET last_checked_at = ?1, next_run_at = ?2
+             WHERE id = ?3",
+            params![now.to_rfc3339(), next, id.to_string()],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(VaultError::NotFound);
+    }
+    Ok(())
+}
+
+pub fn get_subscription(conn: &Connection, id: Uuid) -> Result<Option<SourceSubscription>, VaultError> {
+    conn.query_row(
+        "SELECT id, source, kind, url, target_vault, interval_minutes,
+                next_run_at, last_checked_at, status, created_at
+         FROM source_subscription WHERE id = ?1",
+        [id.to_string()],
+        map_subscription,
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+fn map_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSubscription> {
+    Ok(SourceSubscription {
+        id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?,
+        source: row.get(1)?,
+        kind: row.get(2)?,
+        url: row.get(3)?,
+        target_vault: row.get(4)?,
+        interval_minutes: row.get(5)?,
+        next_run_at: row.get(6)?,
+        last_checked_at: row.get(7)?,
+        status: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn db_err(err: rusqlite::Error) -> VaultError {
+    VaultError::Database {
+        detail: err.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Vault;
+    use tempfile::tempdir;
+
+    #[test]
+    fn create_and_list_subscription() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let sub = create_subscription(
+            conn,
+            &CreateSubscriptionInput {
+                source: "youtube".into(),
+                kind: "playlist".into(),
+                url: "https://youtube.com/playlist?list=PLtest".into(),
+                target_vault: "archiveos".into(),
+                interval_minutes: 60,
+            },
+        )
+        .unwrap();
+        assert_eq!(sub.status, "active");
+
+        let listed = list_subscriptions(conn).unwrap();
+        assert_eq!(listed.len(), 1);
+    }
+
+    #[test]
+    fn due_subscription_advances_next_run() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let sub = create_subscription(
+            conn,
+            &CreateSubscriptionInput {
+                source: "youtube".into(),
+                kind: "playlist".into(),
+                url: "https://youtube.com/playlist?list=PLtest".into(),
+                target_vault: "archiveos".into(),
+                interval_minutes: 30,
+            },
+        )
+        .unwrap();
+
+        let due = due_subscriptions(conn).unwrap();
+        assert_eq!(due.len(), 1);
+
+        mark_subscription_checked(conn, sub.id, sub.interval_minutes).unwrap();
+        let due_after = due_subscriptions(conn).unwrap();
+        assert!(due_after.is_empty());
+    }
+}

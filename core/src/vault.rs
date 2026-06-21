@@ -196,8 +196,16 @@ impl Vault {
         crate::jobs::create_job(self.connection(), job_type, target_vault, input)
     }
 
-    pub fn claim_job(&self, lease_secs: i64) -> Result<Option<crate::jobs::Job>, VaultError> {
-        crate::jobs::claim_job(self.connection(), lease_secs)
+    pub fn claim_job(
+        &self,
+        lease_secs: i64,
+        job_type: Option<&str>,
+    ) -> Result<Option<crate::jobs::Job>, VaultError> {
+        crate::jobs::claim_job(self.connection(), lease_secs, job_type)
+    }
+
+    pub fn heartbeat_job(&self, job_id: Uuid, lease_secs: i64) -> Result<(), VaultError> {
+        crate::jobs::heartbeat_job(self.connection(), job_id, lease_secs)
     }
 
     pub fn finish_job(&self, job_id: Uuid, status: &str) -> Result<(), VaultError> {
@@ -215,6 +223,48 @@ impl Vault {
         external_ids: &[String],
     ) -> Result<Vec<crate::sources::SourceHasHit>, VaultError> {
         crate::sources::sources_has(self.connection(), source, kind, external_ids)
+    }
+
+    pub fn record_source_failure(
+        &self,
+        input: &crate::failures::RecordFailureInput,
+    ) -> Result<crate::failures::SourceFailure, VaultError> {
+        crate::failures::record_failure(self.connection(), input)
+    }
+
+    pub fn list_source_failures(
+        &self,
+        source: Option<&str>,
+        kind: Option<&str>,
+    ) -> Result<Vec<crate::failures::SourceFailure>, VaultError> {
+        crate::failures::list_failures(self.connection(), source, kind)
+    }
+
+    pub fn create_subscription(
+        &self,
+        input: &crate::subscriptions::CreateSubscriptionInput,
+    ) -> Result<crate::subscriptions::SourceSubscription, VaultError> {
+        crate::subscriptions::create_subscription(self.connection(), input)
+    }
+
+    pub fn list_subscriptions(&self) -> Result<Vec<crate::subscriptions::SourceSubscription>, VaultError> {
+        crate::subscriptions::list_subscriptions(self.connection())
+    }
+
+    pub fn delete_subscription(&self, id: Uuid) -> Result<(), VaultError> {
+        crate::subscriptions::delete_subscription(self.connection(), id)
+    }
+
+    pub fn process_due_subscriptions(&self) -> Result<Vec<crate::jobs::Job>, VaultError> {
+        let conn = self.connection();
+        let due = crate::subscriptions::due_subscriptions(conn)?;
+        let mut created = Vec::new();
+        for sub in due {
+            let job = crate::jobs::create_job(conn, "yt-dlp", &sub.target_vault, &sub.url)?;
+            crate::subscriptions::mark_subscription_checked(conn, sub.id, sub.interval_minutes)?;
+            created.push(job);
+        }
+        Ok(created)
     }
 }
 
@@ -281,7 +331,7 @@ mod tests {
             .connection()
             .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 2);
+        assert_eq!(count, DB_SCHEMA_VERSION as i32);
     }
 
     #[test]
