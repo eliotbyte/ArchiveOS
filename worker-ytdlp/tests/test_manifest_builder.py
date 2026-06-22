@@ -70,9 +70,86 @@ def test_build_manifest_playlist_with_membership():
     )
     assert manifest["collection"]["external_id"] == "PLtest"
     assert manifest["membership"] == [
-        {"external_id": "v1", "position": 0},
-        {"external_id": "v2", "position": 1},
+        {"external_id": "v1", "position": 0, "kind": "video", "url": None},
+        {"external_id": "v2", "position": 1, "kind": "video", "url": None},
     ]
+
+
+def test_build_manifest_adds_discovered_items_for_undownloaded_playlist_entries():
+    probe = {
+        "_type": "playlist",
+        "id": "PLtest",
+        "title": "My Playlist",
+        "webpage_url": "https://youtube.com/playlist?list=PLtest",
+        "entries": [
+            {"id": "v1", "url": "https://youtube.com/watch?v=v1", "title": "One"},
+            {"id": "v2", "url": "https://youtube.com/watch?v=v2", "title": "Two"},
+        ],
+    }
+    manifest = build_manifest(
+        vault_name="archiveos",
+        input_url=probe["webpage_url"],
+        probe=probe,
+        items=[
+            build_item(
+                video_id="v2",
+                relative_path="files/v2.mp4",
+                status="complete",
+                info={"id": "v2", "title": "Two"},
+            )
+        ],
+        channels=[],
+        relations=[],
+    )
+
+    discovered = [
+        item for item in manifest["items"]
+        if item["source_ref"]["external_id"] == "v1"
+    ]
+    assert discovered[0]["status"] == "discovered"
+
+
+def test_build_manifest_channel_probe_uses_channel_uploads_collection():
+    probe = {
+        "_type": "playlist",
+        "id": "UC123",
+        "channel_id": "UC123",
+        "channel": "Test Channel",
+        "webpage_url": "https://youtube.com/channel/UC123/videos",
+        "entries": [{"id": "v1"}],
+    }
+    manifest = build_manifest(
+        vault_name="archiveos",
+        input_url=probe["webpage_url"],
+        probe=probe,
+        items=[],
+        channels=[],
+        relations=[],
+    )
+
+    assert manifest["collection"]["type"] == "youtube_channel_uploads"
+
+
+def test_build_manifest_channel_probe_adds_channel_entity():
+    probe = {
+        "_type": "playlist",
+        "id": "UC123",
+        "channel_id": "UC123",
+        "channel": "Test Channel",
+        "channel_url": "https://youtube.com/channel/UC123",
+        "webpage_url": "https://youtube.com/channel/UC123/videos",
+        "entries": [{"id": "v1"}],
+    }
+    manifest = build_manifest(
+        vault_name="archiveos",
+        input_url=probe["webpage_url"],
+        probe=probe,
+        items=[],
+        channels=[],
+        relations=[],
+    )
+
+    assert manifest["channels"][0]["external_id"] == "UC123"
 
 
 def test_metadata_from_info_formats_upload_date():
@@ -105,9 +182,26 @@ def test_classify_private_error():
     assert retryable is False
 
 
+def test_classify_deleted_video():
+    kind, retryable = classify_error("ERROR: Video has been removed by the uploader.")
+    assert kind == "dead"
+    assert retryable is False
+
+
+def test_error_kind_to_item_status_maps_lifecycle():
+    from worker.failures import error_kind_to_item_status
+
+    assert error_kind_to_item_status("private") == "private"
+    assert error_kind_to_item_status("dead") == "dead"
+    assert error_kind_to_item_status("unavailable") == "unavailable"
+    assert error_kind_to_item_status("region_locked") == "region_locked"
+    assert error_kind_to_item_status("unknown") == "failed"
+
+
 def test_channel_from_info_and_relation():
     channel = channel_from_info(
         {
+            "extractor_key": "Youtube",
             "channel_id": "UC123",
             "channel": "Test Channel",
             "channel_url": "https://youtube.com/channel/UC123",
@@ -117,5 +211,5 @@ def test_channel_from_info_and_relation():
     )
     assert channel is not None
     assert channel["external_id"] == "UC123"
-    relation = uploaded_by_relation("vid1", "UC123")
+    relation = uploaded_by_relation("vid1", "UC123", "youtube")
     assert relation["relation"] == "uploaded_by"

@@ -1,4 +1,5 @@
 pub mod cas;
+pub mod assets;
 pub mod db;
 pub mod entity;
 pub mod failures;

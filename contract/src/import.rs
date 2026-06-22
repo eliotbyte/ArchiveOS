@@ -12,7 +12,11 @@ pub enum ImportStrategy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportManifest {
+    /// Worker identity, e.g. "yt-dlp".
     pub source: String,
+    /// Platform/extractor identity for source_ref rows, e.g. "youtube", "pornhub".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_identity: Option<String>,
     pub vault: String,
     pub strategy: ImportStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,6 +52,22 @@ pub struct ManifestItem {
     pub metadata: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata_by_provenance: BTreeMap<String, serde_json::Value>,
+    /// Remote or downloaded supporting assets (subtitles, audio tracks, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<ManifestAssetCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestAssetCatalogEntry {
+    /// Stable dedupe key within the parent entity, e.g. "subtitle:en:vtt:manual".
+    pub track_key: String,
+    pub role: String,
+    pub kind: String,
+    pub status: String,
+    pub storage_strategy: String,
+    pub external_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +83,14 @@ pub struct ManifestSourceRef {
 pub struct ManifestMembership {
     pub external_id: String,
     pub position: i32,
+    #[serde(default = "default_membership_kind")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+fn default_membership_kind() -> String {
+    "video".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +102,8 @@ pub struct ManifestChannel {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata_by_provenance: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,8 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use archiveos_contract::{
-    ImportManifest, ImportReport, ImportStrategy, VaultError, VaultMetadata, ARCHIVEOS_DIR,
-    BLOBS_DIR, DB_FILE, INBOX_DIR, STAGING_DIR, VAULT_JSON,
+    ImportManifest, ImportReport, ImportStrategy, VaultError, VaultMetadata,
+    YtdlpJobInput, ARCHIVEOS_DIR, BLOBS_DIR, DB_FILE, INBOX_DIR, STAGING_DIR, VAULT_JSON,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -216,6 +216,26 @@ impl Vault {
         crate::jobs::get_job(self.connection(), job_id)
     }
 
+    pub fn list_jobs(
+        &self,
+        filter: crate::jobs::JobListFilter<'_>,
+    ) -> Result<Vec<crate::jobs::Job>, VaultError> {
+        crate::jobs::list_jobs(self.connection(), filter)
+    }
+
+    pub fn retry_job(&self, job_id: Uuid) -> Result<crate::jobs::Job, VaultError> {
+        crate::jobs::retry_job(self.connection(), job_id)
+    }
+
+    pub fn create_archive_job(
+        &self,
+        target_vault: &str,
+        input: YtdlpJobInput,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        let payload = input.to_json()?;
+        crate::jobs::create_job(self.connection(), "yt-dlp", target_vault, &payload)
+    }
+
     pub fn sources_has(
         &self,
         source: &str,
@@ -255,16 +275,250 @@ impl Vault {
         crate::subscriptions::delete_subscription(self.connection(), id)
     }
 
+    pub fn delete_entity(&self, entity_id: Uuid) -> Result<(), VaultError> {
+        let assets = crate::assets::list_assets(self.connection(), entity_id)?;
+        for asset in &assets {
+            remove_asset_file(asset)?;
+        }
+        let changed = self
+            .connection()
+            .execute(
+                "UPDATE entity SET status = 'user_deleted' WHERE id = ?1",
+                [entity_id.to_string()],
+            )
+            .map_err(db_err)?;
+        if changed == 0 {
+            return Err(VaultError::NotFound);
+        }
+        crate::assets::mark_entity_assets_deleted(self.connection(), entity_id)
+    }
+
+    pub fn delete_asset(&self, asset_id: Uuid) -> Result<(), VaultError> {
+        let asset = crate::assets::get_asset(self.connection(), asset_id)?;
+        remove_asset_file(&asset)?;
+        let now = Utc::now().to_rfc3339();
+        crate::assets::mark_asset_status(
+            self.connection(),
+            asset_id,
+            "deleted_by_user",
+            Some(&now),
+        )
+    }
+
+    pub fn remove_collection_member(
+        &self,
+        collection_id: Uuid,
+        entity_id: Uuid,
+    ) -> Result<(), VaultError> {
+        crate::import::db::mark_collection_member_user_removed(
+            self.connection(),
+            collection_id,
+            entity_id,
+        )
+    }
+
+    pub fn reconcile_assets(&self) -> Result<u32, VaultError> {
+        let mut stmt = self
+            .connection()
+            .prepare(
+                "SELECT id, entity_id, role, kind, content_hash, mime, size, ext, status,
+                        storage_strategy, path, created_at, updated_at, deleted_at
+                 FROM entity_asset
+                 WHERE status = 'present'",
+            )
+            .map_err(db_err)?;
+        let assets = stmt
+            .query_map([], |row| {
+                Ok(crate::assets::EntityAsset {
+                    id: parse_uuid(row, 0)?,
+                    entity_id: parse_uuid(row, 1)?,
+                    role: row.get(2)?,
+                    kind: row.get(3)?,
+                    content_hash: row.get(4)?,
+                    mime: row.get(5)?,
+                    size: row.get(6)?,
+                    ext: row.get(7)?,
+                    status: row.get(8)?,
+                    storage_strategy: row.get(9)?,
+                    path: row.get(10)?,
+                    created_at: row.get(11)?,
+                    updated_at: row.get(12)?,
+                    deleted_at: row.get(13)?,
+                })
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+
+        let mut changed = 0;
+        for asset in assets {
+            if asset_path_exists(&asset) {
+                continue;
+            }
+            crate::assets::mark_asset_status(self.connection(), asset.id, "missing_local", None)?;
+            changed += 1;
+        }
+        Ok(changed)
+    }
+
+    pub fn create_asset_acquisition_job(
+        &self,
+        target_vault: &str,
+        entity_id: Uuid,
+        asset_id: Uuid,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        let asset = crate::assets::get_asset(self.connection(), asset_id)?;
+        if !crate::assets::asset_belongs_to_entity(&asset, entity_id) {
+            return Err(VaultError::NotFound);
+        }
+        if asset.status != "remote" && asset.status != "missing_local" {
+            return Err(VaultError::InvalidLayout {
+                detail: format!(
+                    "asset {} has status '{}'; only remote or missing_local can be acquired",
+                    asset_id, asset.status
+                ),
+            });
+        }
+        let input = serde_json::json!({
+            "entity_id": entity_id,
+            "asset_id": asset_id,
+        });
+        crate::jobs::create_job(
+            self.connection(),
+            "yt-dlp-asset",
+            target_vault,
+            &input.to_string(),
+        )
+    }
+
+    pub fn commit_asset_file(
+        &self,
+        entity_id: Uuid,
+        asset_id: Uuid,
+        job_id: Uuid,
+        relative_path: &str,
+    ) -> Result<crate::assets::EntityAsset, VaultError> {
+        let asset = crate::assets::get_asset(self.connection(), asset_id)?;
+        if !crate::assets::asset_belongs_to_entity(&asset, entity_id) {
+            return Err(VaultError::NotFound);
+        }
+
+        let staging_file = resolve_staging_file(self.staging_job_dir(&job_id.to_string()), relative_path)?;
+        let ext = extension_from_path(&staging_file);
+        let ext_for_store = ext.strip_prefix('.').unwrap_or(&ext);
+        let cas = self.store_managed(&staging_file, ext_for_store)?;
+        let mime = guess_mime(&cas.blob_path);
+        let path_str = cas.blob_path.to_string_lossy().into_owned();
+
+        crate::assets::mark_catalog_asset_present(
+            self.connection(),
+            asset_id,
+            &crate::assets::UpsertAssetInput {
+                entity_id,
+                role: &asset.role,
+                kind: &asset.kind,
+                content_hash: Some(&cas.content_hash),
+                mime: Some(&mime),
+                size: cas.size,
+                ext: Some(&ext),
+                status: "present",
+                storage_strategy: "managed",
+                path: Some(&path_str),
+            },
+        )?;
+
+        crate::assets::get_asset(self.connection(), asset_id)
+    }
+
     pub fn process_due_subscriptions(&self) -> Result<Vec<crate::jobs::Job>, VaultError> {
         let conn = self.connection();
         let due = crate::subscriptions::due_subscriptions(conn)?;
         let mut created = Vec::new();
         for sub in due {
-            let job = crate::jobs::create_job(conn, "yt-dlp", &sub.target_vault, &sub.url)?;
+            let input = crate::subscriptions::subscription_job_input(&sub)?;
+            let job = crate::jobs::create_job(conn, "yt-dlp", &sub.target_vault, &input)?;
             crate::subscriptions::mark_subscription_checked(conn, sub.id, sub.interval_minutes)?;
             created.push(job);
         }
         Ok(created)
+    }
+}
+
+fn remove_asset_file(asset: &crate::assets::EntityAsset) -> Result<(), VaultError> {
+    let Some(path) = &asset.path else {
+        return Ok(());
+    };
+    let path = Path::new(path);
+    if path.is_file() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn asset_path_exists(asset: &crate::assets::EntityAsset) -> bool {
+    asset
+        .path
+        .as_deref()
+        .map(|path| Path::new(path).is_file())
+        .unwrap_or(false)
+}
+
+fn resolve_staging_file(staging_dir: PathBuf, relative_path: &str) -> Result<PathBuf, VaultError> {
+    if relative_path.is_empty()
+        || relative_path.contains('\\')
+        || relative_path.starts_with('/')
+        || relative_path.contains("..")
+    {
+        return Err(VaultError::InvalidLayout {
+            detail: format!("invalid staging relative path: {relative_path}"),
+        });
+    }
+    let staging_file = staging_dir.join(relative_path);
+    let canonical_staging = staging_dir
+        .canonicalize()
+        .map_err(VaultError::Io)?;
+    let canonical_file = staging_file.canonicalize().map_err(|err| {
+        VaultError::InvalidLayout {
+            detail: format!(
+                "staging file not found under {}: {err}",
+                staging_dir.display()
+            ),
+        }
+    })?;
+    if !canonical_file.starts_with(&canonical_staging) {
+        return Err(VaultError::InvalidLayout {
+            detail: format!("staging path escapes job directory: {relative_path}"),
+        });
+    }
+    Ok(canonical_file)
+}
+
+fn guess_mime(path: &Path) -> String {
+    mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .to_string()
+}
+
+fn extension_from_path(path: &Path) -> String {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default()
+}
+
+fn parse_uuid(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Uuid> {
+    Uuid::parse_str(&row.get::<_, String>(idx)?).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            idx,
+            rusqlite::types::Type::Text,
+            Box::new(err),
+        )
+    })
+}
+
+fn db_err(err: rusqlite::Error) -> VaultError {
+    VaultError::Database {
+        detail: err.to_string(),
     }
 }
 
@@ -354,5 +608,153 @@ mod tests {
         assert!(!result.deduped);
         assert!(result.blob_path.starts_with(vault.blobs_dir()));
         assert!(vault.blob_exists(&result.content_hash, ".jpg").unwrap());
+    }
+
+    #[test]
+    fn delete_entity_marks_tombstone_and_assets_deleted() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        std::fs::write(vault.inbox_dir().join("video.mp4"), b"video").unwrap();
+        vault.process_inbox().unwrap();
+
+        let entity_id: Uuid = vault
+            .connection()
+            .query_row("SELECT id FROM entity LIMIT 1", [], |row| {
+                let id: String = row.get(0)?;
+                Ok(Uuid::parse_str(&id).unwrap())
+            })
+            .unwrap();
+
+        vault.delete_entity(entity_id).unwrap();
+
+        let status: String = vault
+            .connection()
+            .query_row(
+                "SELECT status FROM entity WHERE id = ?1",
+                [entity_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "user_deleted");
+
+        let asset_status: String = vault
+            .connection()
+            .query_row(
+                "SELECT status FROM entity_asset WHERE entity_id = ?1",
+                [entity_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(asset_status, "deleted_by_user");
+    }
+
+    #[test]
+    fn commit_asset_file_promotes_remote_track_to_present() {
+        use archiveos_contract::ManifestAssetCatalogEntry;
+        use crate::assets::{get_asset, upsert_catalog_asset};
+        use crate::import::db::insert_entity;
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+        let entity_id = Uuid::new_v4();
+        let now = chrono::Utc::now().to_rfc3339();
+        insert_entity(conn, entity_id, None, None, 0, "active", &now, None).unwrap();
+
+        let asset_id = upsert_catalog_asset(
+            conn,
+            entity_id,
+            &ManifestAssetCatalogEntry {
+                track_key: "subtitle:en:vtt:manual".into(),
+                role: "supporting".into(),
+                kind: "subtitle".into(),
+                status: "remote".into(),
+                storage_strategy: "remote".into(),
+                external_id: "vid:subtitle:en:vtt:manual".into(),
+                metadata: BTreeMap::from([
+                    ("language".into(), serde_json::json!("en")),
+                    ("source_url".into(), serde_json::json!("https://example.com/en.vtt")),
+                ]),
+            },
+        )
+        .unwrap();
+
+        let job = vault
+            .create_asset_acquisition_job("test-vault", entity_id, asset_id)
+            .unwrap();
+        assert_eq!(job.job_type, "yt-dlp-asset");
+
+        let staging_file = vault
+            .staging_job_dir(&job.id.to_string())
+            .join("files/en.vtt");
+        std::fs::create_dir_all(staging_file.parent().unwrap()).unwrap();
+        std::fs::write(&staging_file, b"WEBVTT\n").unwrap();
+
+        let committed = vault
+            .commit_asset_file(entity_id, asset_id, job.id, "files/en.vtt")
+            .unwrap();
+        assert_eq!(committed.status, "present");
+        assert!(committed.content_hash.is_some());
+        assert_eq!(committed.mime.as_deref(), Some("text/vtt"));
+
+        let reloaded = get_asset(conn, asset_id).unwrap();
+        assert_eq!(reloaded.status, "present");
+    }
+
+    #[test]
+    fn delete_asset_keeps_entity_active() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        std::fs::write(vault.inbox_dir().join("video.mp4"), b"video").unwrap();
+        vault.process_inbox().unwrap();
+
+        let (entity_id, asset_id): (Uuid, Uuid) = vault
+            .connection()
+            .query_row(
+                "SELECT e.id, a.id FROM entity e JOIN entity_asset a ON a.entity_id = e.id LIMIT 1",
+                [],
+                |row| {
+                    let entity: String = row.get(0)?;
+                    let asset: String = row.get(1)?;
+                    Ok((Uuid::parse_str(&entity).unwrap(), Uuid::parse_str(&asset).unwrap()))
+                },
+            )
+            .unwrap();
+
+        vault.delete_asset(asset_id).unwrap();
+
+        let status: String = vault
+            .connection()
+            .query_row(
+                "SELECT status FROM entity WHERE id = ?1",
+                [entity_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "active");
+    }
+
+    #[test]
+    fn reconcile_missing_assets_marks_missing_local() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        std::fs::write(vault.inbox_dir().join("video.mp4"), b"video").unwrap();
+        vault.process_inbox().unwrap();
+
+        let asset_path: String = vault
+            .connection()
+            .query_row("SELECT path FROM entity_asset LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        std::fs::remove_file(asset_path).unwrap();
+
+        let changed = vault.reconcile_assets().unwrap();
+        assert_eq!(changed, 1);
+
+        let status: String = vault
+            .connection()
+            .query_row("SELECT status FROM entity_asset LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "missing_local");
     }
 }

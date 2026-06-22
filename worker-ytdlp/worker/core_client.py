@@ -28,13 +28,13 @@ class CoreClient:
         )
         response.raise_for_status()
 
-    def sources_has(
+    def source_states(
         self,
         external_ids: list[str],
         *,
         source: str = "youtube",
         kind: str = "video",
-    ) -> dict[str, bool]:
+    ) -> dict[str, dict[str, Any]]:
         if not external_ids:
             return {}
         response = self.session.get(
@@ -48,10 +48,26 @@ class CoreClient:
         )
         response.raise_for_status()
         hits = response.json()
-        present: dict[str, bool] = {}
+        states: dict[str, dict[str, Any]] = {}
         for hit in hits:
-            present[hit["external_id"]] = bool(hit.get("present"))
-        return present
+            states[hit["external_id"]] = hit
+        return states
+
+    def sources_has(
+        self,
+        external_ids: list[str],
+        *,
+        source: str = "youtube",
+        kind: str = "video",
+    ) -> dict[str, bool]:
+        return {
+            external_id: bool(state.get("present"))
+            for external_id, state in self.source_states(
+                external_ids,
+                source=source,
+                kind=kind,
+            ).items()
+        }
 
     def submit_manifest(
         self,
@@ -67,6 +83,38 @@ class CoreClient:
             f"{self.core_url}/vaults/{self.vault_name}/jobs/{job_id}/manifest",
             json=payload,
             timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def get_entity(self, entity_id: str) -> dict[str, Any]:
+        response = self.session.get(
+            f"{self.core_url}/vaults/{self.vault_name}/entities/{entity_id}",
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def commit_asset(
+        self,
+        entity_id: str,
+        asset_id: str,
+        job_id: str,
+        relative_path: str,
+    ) -> dict[str, Any]:
+        response = self.session.post(
+            f"{self.core_url}/vaults/{self.vault_name}/entities/{entity_id}/assets/{asset_id}/commit",
+            json={"job_id": job_id, "path": relative_path},
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def finish_job(self, job_id: str, *, status: str = "done") -> dict[str, Any]:
+        response = self.session.post(
+            f"{self.core_url}/vaults/{self.vault_name}/jobs/{job_id}/finish",
+            json={"status": status},
+            timeout=30,
         )
         response.raise_for_status()
         return response.json()

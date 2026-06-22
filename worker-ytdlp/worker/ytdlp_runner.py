@@ -15,13 +15,14 @@ class YtdlpError(RuntimeError):
     pass
 
 
-def probe_url(url: str, *, playlist_max_items: int | None = None) -> dict[str, Any]:
+def probe_url(url: str, *, playlist_max_items: int | None = None, extra_args: list[str] | None = None) -> dict[str, Any]:
     cmd = [
         "yt-dlp",
         "--dump-single-json",
         "--flat-playlist",
         "--no-warnings",
         "--skip-download",
+        *(extra_args or []),
     ]
     if playlist_max_items:
         cmd.extend(["--playlist-end", str(playlist_max_items)])

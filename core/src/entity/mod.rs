@@ -6,6 +6,15 @@ use uuid::Uuid;
 
 use crate::metadata;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntityPreview {
+    pub entity_id: Uuid,
+    pub asset_id: Uuid,
+    pub kind: String,
+    pub preview_role: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct EntityDetail {
     pub id: Uuid,
@@ -18,6 +27,8 @@ pub struct EntityDetail {
     pub tags: Vec<String>,
     pub metadata: HashMap<String, String>,
     pub metadata_entries: Vec<MetadataEntry>,
+    pub assets: Vec<crate::assets::EntityAssetWithMetadata>,
+    pub preview: Option<EntityPreview>,
 }
 
 pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, VaultError> {
@@ -61,6 +72,8 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
     let tags = crate::tags::list_entity_tags(conn, id)?;
     let metadata_entries = load_metadata_entries(conn, id)?;
     let metadata = metadata::flatten_metadata(&metadata_entries);
+    let assets = crate::assets::list_assets_with_metadata(conn, id)?;
+    let preview = resolve_entity_preview(conn, id)?;
 
     Ok(EntityDetail {
         id,
@@ -73,7 +86,67 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
         tags,
         metadata,
         metadata_entries,
+        assets,
+        preview,
     })
+}
+
+pub fn resolve_entity_preview(
+    conn: &Connection,
+    entity_id: Uuid,
+) -> Result<Option<EntityPreview>, VaultError> {
+    let thumb_external_id: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata
+             WHERE entity_id = ?1 AND key = 'thumbnail_external_id' AND provenance = 'archiveos'
+             LIMIT 1",
+            [entity_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+
+    let Some(external_id) = thumb_external_id else {
+        return Ok(None);
+    };
+
+    conn.query_row(
+        "SELECT ea.entity_id, ea.id, ea.kind, ea.status,
+                COALESCE(
+                    (SELECT value FROM entity_asset_metadata
+                     WHERE asset_id = ea.id AND key = 'preview_role' LIMIT 1),
+                    'source_thumbnail'
+                ) AS preview_role
+         FROM source_ref sr
+         JOIN entity_asset ea ON ea.entity_id = sr.entity_id
+         WHERE sr.external_id = ?1 AND sr.kind = 'thumbnail'
+           AND ea.kind = 'thumbnail' AND ea.status = 'present'
+         LIMIT 1",
+        [external_id],
+        |row| {
+            Ok(EntityPreview {
+                entity_id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                asset_id: Uuid::parse_str(&row.get::<_, String>(1)?).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                kind: row.get(2)?,
+                status: row.get(3)?,
+                preview_role: row.get(4)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(db_err)
 }
 
 fn load_metadata_entries(

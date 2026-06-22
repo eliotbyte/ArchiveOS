@@ -78,7 +78,7 @@ def test_build_item_splits_metadata_by_provenance():
 
 
 def test_thumbnail_relation_shape():
-    relation = thumbnail_relation("vid1")
+    relation = thumbnail_relation("vid1", "youtube")
     assert relation["relation"] == "thumbnail"
     assert relation["to_external_id"] == "vid1:thumbnail"
 

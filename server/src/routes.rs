@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use archiveos_contract::{ImportManifest, ImportStrategy, SearchQuery, VaultRegistryEntry};
+use archiveos_contract::{AssetPolicy, ImportManifest, ImportStrategy, SearchQuery, SubscriptionOptions, VaultRegistryEntry, YtdlpJobInput};
 use archiveos_core::{open_vault_ref, Vault};
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post};
@@ -16,17 +16,39 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/vaults", get(list_vaults).post(register_vault))
         .route("/vaults/{name}", delete(unregister_vault))
-        .route("/vaults/{vault}/entities/{id}", get(get_entity))
+        .route("/vaults/{vault}/entities/{id}", get(get_entity).delete(delete_entity))
+        .route(
+            "/vaults/{vault}/entities/{id}/assets/{asset_id}",
+            delete(delete_asset),
+        )
+        .route(
+            "/vaults/{vault}/entities/{id}/assets/{asset_id}/acquire",
+            post(acquire_asset),
+        )
+        .route(
+            "/vaults/{vault}/entities/{id}/assets/{asset_id}/commit",
+            post(commit_asset),
+        )
+        .route("/vaults/{vault}/reconcile/assets", post(reconcile_assets))
+        .route(
+            "/vaults/{vault}/collections/{collection_id}/members/{entity_id}",
+            delete(remove_collection_member),
+        )
         .route("/vaults/{vault}/search", get(search_entities))
         .route("/vaults/{vault}/entities/{id}/tags", post(add_tag))
         .route(
             "/vaults/{vault}/entities/{id}/tags/{tag}",
             delete(remove_tag),
         )
-        .route("/vaults/{vault}/jobs", post(create_job))
+        .route("/vaults/{vault}/jobs", get(list_jobs).post(create_job))
+        .route("/vaults/{vault}/jobs/{id}", get(get_job))
+        .route("/vaults/{vault}/jobs/{id}/retry", post(retry_job))
+        .route("/vaults/{vault}/archive", post(create_archive))
+        .route("/vaults/{vault}/subscribe", post(subscribe_archive))
         .route("/vaults/{vault}/jobs/claim", post(claim_job))
         .route("/vaults/{vault}/jobs/{id}/heartbeat", post(heartbeat_job))
         .route("/vaults/{vault}/jobs/{id}/manifest", post(submit_manifest))
+        .route("/vaults/{vault}/jobs/{id}/finish", post(finish_job))
         .route("/vaults/{vault}/sources/has", get(sources_has))
         .route("/vaults/{vault}/source-failures", get(list_source_failures).post(record_source_failure))
         .route("/vaults/{vault}/subscriptions", get(list_subscriptions).post(create_subscription))
@@ -93,11 +115,86 @@ async fn get_entity(
     Ok(Json(EntityDetailResponse::from(detail)))
 }
 
+async fn delete_entity(
+    State(state): State<Arc<AppState>>,
+    Path((vault, id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault)?;
+    vault.delete_entity(id)?;
+    Ok(Json(serde_json::json!({ "entity_id": id, "status": "user_deleted" })))
+}
+
+async fn delete_asset(
+    State(state): State<Arc<AppState>>,
+    Path((vault, _id, asset_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault)?;
+    vault.delete_asset(asset_id)?;
+    Ok(Json(serde_json::json!({ "asset_id": asset_id, "status": "deleted_by_user" })))
+}
+
+async fn acquire_asset(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id, asset_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.create_asset_acquisition_job(&vault_name, entity_id, asset_id)?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+#[derive(Deserialize)]
+struct CommitAssetRequest {
+    job_id: Uuid,
+    path: String,
+}
+
+async fn commit_asset(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id, asset_id)): Path<(String, Uuid, Uuid)>,
+    Json(body): Json<CommitAssetRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let asset = vault.commit_asset_file(entity_id, asset_id, body.job_id, &body.path)?;
+    vault.finish_job(body.job_id, "done")?;
+    Ok(Json(serde_json::json!({
+        "entity_id": entity_id,
+        "asset_id": asset.id,
+        "status": asset.status,
+        "content_hash": asset.content_hash,
+        "path": asset.path,
+    })))
+}
+
+async fn reconcile_assets(
+    State(state): State<Arc<AppState>>,
+    Path(vault): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault)?;
+    let changed = vault.reconcile_assets()?;
+    Ok(Json(serde_json::json!({ "missing_local": changed })))
+}
+
+async fn remove_collection_member(
+    State(state): State<Arc<AppState>>,
+    Path((vault, collection_id, entity_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault)?;
+    vault.remove_collection_member(collection_id, entity_id)?;
+    Ok(Json(serde_json::json!({
+        "collection_id": collection_id,
+        "entity_id": entity_id,
+        "status": "user_removed"
+    })))
+}
+
 #[derive(Serialize)]
 struct EntityDetailResponse {
     id: Uuid,
+    /// Legacy read-model fields. Canonical bytes and renditions live in `assets`.
     content_hash: Option<String>,
+    /// Legacy read-model fields. Canonical bytes and renditions live in `assets`.
     mime: Option<String>,
+    /// Legacy read-model fields. Canonical bytes and renditions live in `assets`.
     size: i64,
     status: String,
     added_at: String,
@@ -105,6 +202,29 @@ struct EntityDetailResponse {
     tags: Vec<String>,
     metadata: std::collections::HashMap<String, String>,
     metadata_entries: Vec<archiveos_contract::MetadataEntry>,
+    assets: Vec<EntityAssetResponse>,
+    preview: Option<EntityPreviewResponse>,
+}
+
+#[derive(Serialize)]
+struct EntityPreviewResponse {
+    entity_id: Uuid,
+    asset_id: Uuid,
+    kind: String,
+    preview_role: String,
+    status: String,
+}
+
+impl From<archiveos_core::entity::EntityPreview> for EntityPreviewResponse {
+    fn from(p: archiveos_core::entity::EntityPreview) -> Self {
+        Self {
+            entity_id: p.entity_id,
+            asset_id: p.asset_id,
+            kind: p.kind,
+            preview_role: p.preview_role,
+            status: p.status,
+        }
+    }
 }
 
 impl From<archiveos_core::entity::EntityDetail> for EntityDetailResponse {
@@ -120,6 +240,50 @@ impl From<archiveos_core::entity::EntityDetail> for EntityDetailResponse {
             tags: d.tags,
             metadata: d.metadata,
             metadata_entries: d.metadata_entries,
+            assets: d.assets.into_iter().map(EntityAssetResponse::from).collect(),
+            preview: d.preview.map(EntityPreviewResponse::from),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct EntityAssetResponse {
+    id: Uuid,
+    role: String,
+    kind: String,
+    content_hash: Option<String>,
+    mime: Option<String>,
+    size: i64,
+    ext: Option<String>,
+    status: String,
+    storage_strategy: String,
+    path: Option<String>,
+    created_at: String,
+    updated_at: String,
+    deleted_at: Option<String>,
+    metadata: std::collections::HashMap<String, String>,
+    metadata_entries: Vec<archiveos_contract::MetadataEntry>,
+}
+
+impl From<archiveos_core::assets::EntityAssetWithMetadata> for EntityAssetResponse {
+    fn from(item: archiveos_core::assets::EntityAssetWithMetadata) -> Self {
+        let asset = item.asset;
+        Self {
+            id: asset.id,
+            role: asset.role,
+            kind: asset.kind,
+            content_hash: asset.content_hash,
+            mime: asset.mime,
+            size: asset.size,
+            ext: asset.ext,
+            status: asset.status,
+            storage_strategy: asset.storage_strategy,
+            path: asset.path,
+            created_at: asset.created_at,
+            updated_at: asset.updated_at,
+            deleted_at: asset.deleted_at,
+            metadata: item.metadata,
+            metadata_entries: item.metadata_entries,
         }
     }
 }
@@ -184,6 +348,130 @@ async fn create_job(
 ) -> ApiResult<Json<JobResponse>> {
     let vault = open_vault(&state, &vault_name)?;
     let job = vault.create_job(&body.job_type, &vault_name, &body.input)?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+#[derive(Deserialize)]
+struct ArchiveRequest {
+    url: String,
+    #[serde(default = "default_mode_once")]
+    mode: String,
+    #[serde(default = "default_true")]
+    resync: bool,
+    #[serde(default = "default_removed_items")]
+    removed_items: String,
+    #[serde(default)]
+    asset_policy: AssetPolicy,
+}
+
+fn default_mode_once() -> String {
+    "once".into()
+}
+
+fn default_removed_items() -> String {
+    "mark_removed".into()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn create_archive(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Json(body): Json<ArchiveRequest>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.create_archive_job(
+        &vault_name,
+        YtdlpJobInput {
+            url: body.url,
+            mode: body.mode,
+            resync: body.resync,
+            removed_items: body.removed_items,
+            asset_policy: body.asset_policy,
+        },
+    )?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+#[derive(Deserialize)]
+struct SubscribeArchiveRequest {
+    source: String,
+    kind: String,
+    url: String,
+    interval_minutes: i32,
+    #[serde(default = "default_true")]
+    resync: bool,
+    #[serde(default = "default_removed_items")]
+    removed_items: String,
+    #[serde(default)]
+    asset_policy: AssetPolicy,
+}
+
+async fn subscribe_archive(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Json(body): Json<SubscribeArchiveRequest>,
+) -> ApiResult<Json<SubscriptionResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let sub = vault.create_subscription(&archiveos_core::subscriptions::CreateSubscriptionInput {
+        source: body.source,
+        kind: body.kind,
+        url: body.url,
+        target_vault: vault_name,
+        interval_minutes: body.interval_minutes,
+        options: Some(SubscriptionOptions {
+            resync: body.resync,
+            removed_items: body.removed_items,
+            asset_policy: body.asset_policy,
+        }),
+    })?;
+    Ok(Json(SubscriptionResponse::from(sub)))
+}
+
+#[derive(Deserialize)]
+struct ListJobsParams {
+    status: Option<String>,
+    #[serde(rename = "type")]
+    job_type: Option<String>,
+    #[serde(default = "default_job_limit")]
+    limit: i32,
+}
+
+fn default_job_limit() -> i32 {
+    50
+}
+
+async fn list_jobs(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Query(params): Query<ListJobsParams>,
+) -> ApiResult<Json<Vec<JobResponse>>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let jobs = vault.list_jobs(archiveos_core::jobs::JobListFilter {
+        status: params.status.as_deref(),
+        job_type: params.job_type.as_deref(),
+        limit: params.limit,
+    })?;
+    Ok(Json(jobs.into_iter().map(JobResponse::from).collect()))
+}
+
+async fn get_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.get_job(job_id)?.ok_or(archiveos_contract::VaultError::NotFound)?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+async fn retry_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.retry_job(job_id)?;
     Ok(Json(JobResponse::from(job)))
 }
 
@@ -315,6 +603,36 @@ async fn submit_manifest(
 }
 
 #[derive(Deserialize)]
+struct FinishJobRequest {
+    #[serde(default = "default_finish_status")]
+    status: String,
+}
+
+fn default_finish_status() -> String {
+    "done".into()
+}
+
+async fn finish_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+    body: Option<Json<FinishJobRequest>>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    if vault.get_job(job_id)?.is_none() {
+        return Err(archiveos_contract::VaultError::NotFound.into());
+    }
+    let status = body
+        .map(|b| b.status.clone())
+        .unwrap_or_else(default_finish_status);
+    let final_status = match status.as_str() {
+        "done" | "partial" | "failed" => status,
+        _ => "done".to_string(),
+    };
+    vault.finish_job(job_id, &final_status)?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "status": final_status })))
+}
+
+#[derive(Deserialize)]
 struct SourcesHasParams {
     source: String,
     kind: String,
@@ -341,6 +659,11 @@ async fn sources_has(
                 external_id: h.external_id,
                 entity_id: h.entity_id,
                 present: h.present,
+                known: h.known,
+                entity_status: h.entity_status,
+                source_status: h.source_status,
+                has_present_asset: h.has_present_asset,
+                asset_statuses: h.asset_statuses,
             })
             .collect(),
     ))
@@ -351,6 +674,11 @@ struct SourceHasResponse {
     external_id: String,
     entity_id: String,
     present: bool,
+    known: bool,
+    entity_status: String,
+    source_status: String,
+    has_present_asset: bool,
+    asset_statuses: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -448,6 +776,12 @@ struct CreateSubscriptionRequest {
     pub kind: String,
     pub url: String,
     pub interval_minutes: i32,
+    #[serde(default = "default_true")]
+    pub resync: bool,
+    #[serde(default = "default_removed_items")]
+    pub removed_items: String,
+    #[serde(default)]
+    pub asset_policy: AssetPolicy,
 }
 
 #[derive(Serialize)]
@@ -462,6 +796,7 @@ struct SubscriptionResponse {
     last_checked_at: Option<String>,
     status: String,
     created_at: String,
+    options: Option<SubscriptionOptions>,
 }
 
 impl From<archiveos_core::subscriptions::SourceSubscription> for SubscriptionResponse {
@@ -477,6 +812,7 @@ impl From<archiveos_core::subscriptions::SourceSubscription> for SubscriptionRes
             last_checked_at: s.last_checked_at,
             status: s.status,
             created_at: s.created_at,
+            options: s.options,
         }
     }
 }
@@ -493,6 +829,11 @@ async fn create_subscription(
         url: body.url,
         target_vault: vault_name,
         interval_minutes: body.interval_minutes,
+        options: Some(SubscriptionOptions {
+            resync: body.resync,
+            removed_items: body.removed_items,
+            asset_policy: body.asset_policy,
+        }),
     })?;
     Ok(Json(SubscriptionResponse::from(sub)))
 }

@@ -5,8 +5,8 @@ from typing import Any
 from .ytdlp_runner import YtdlpError, probe_url
 
 
-def discover(url: str, *, playlist_max_items: int | None = None) -> dict[str, Any]:
-    return probe_url(url, playlist_max_items=playlist_max_items)
+def discover(url: str, *, playlist_max_items: int | None = None, extra_args: list[str] | None = None) -> dict[str, Any]:
+    return probe_url(url, playlist_max_items=playlist_max_items, extra_args=extra_args)
 
 
 def list_video_ids(probe: dict[str, Any]) -> list[str]:

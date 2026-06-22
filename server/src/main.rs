@@ -1,3 +1,4 @@
+mod asset_reconcile_scheduler;
 mod error;
 mod inbox_watcher;
 mod routes;
@@ -54,6 +55,13 @@ async fn main() {
             .expect("ARCHIVEOS_DEFAULT_VAULT required when subscription scheduler enabled");
         subscription_scheduler::spawn(config_dir.clone(), vault_name);
         tracing::info!("subscription scheduler started");
+    }
+
+    if asset_reconcile_scheduler::enabled() {
+        let vault_name = std::env::var("ARCHIVEOS_DEFAULT_VAULT")
+            .expect("ARCHIVEOS_DEFAULT_VAULT required when asset reconcile scheduler enabled");
+        asset_reconcile_scheduler::spawn(config_dir.clone(), vault_name);
+        tracing::info!("asset reconcile scheduler started");
     }
 
     let state = Arc::new(AppState { config_dir });

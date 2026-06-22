@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::Connection;
 use uuid::Uuid;
 
+use crate::assets::UpsertAssetInput;
 use crate::cas;
 use crate::import::db;
 use crate::tags::add_tag;
@@ -148,7 +149,7 @@ fn create_folder_collection(
 ) -> Result<Uuid, VaultError> {
     let id = Uuid::new_v4();
     let now = Utc::now().to_rfc3339();
-    db::insert_entity(conn, id, None, None, 0, "present", &now, None)?;
+    db::insert_entity(conn, id, None, None, 0, "active", &now, None)?;
     db::insert_collection(conn, id, "folder", title)?;
     db::set_collection_fingerprint(conn, id, fingerprint)?;
     db::add_collection_source_path(conn, id, source_path)?;
@@ -205,7 +206,7 @@ fn import_file(
             Some(&cas.content_hash),
             Some(&mime),
             cas.size,
-            "present",
+            "active",
             &now,
             entity_created_at,
         )?;
@@ -216,6 +217,22 @@ fn import_file(
     if let Some(name) = file_path.file_name().and_then(|n| n.to_str()) {
         db::upsert_metadata(conn, entity_id, "title", name, "inferred")?;
     }
+    let asset_path = cas.blob_path.to_string_lossy().into_owned();
+    crate::assets::upsert_asset(
+        conn,
+        &UpsertAssetInput {
+            entity_id,
+            role: "primary",
+            kind: "file",
+            content_hash: Some(&cas.content_hash),
+            mime: Some(&mime),
+            size: cas.size,
+            ext: Some(&ext),
+            status: "present",
+            storage_strategy: "managed",
+            path: Some(&asset_path),
+        },
+    )?;
     if let Some(relative_path) = source_relative_path {
         db::upsert_metadata(conn, entity_id, "source_relative_path", relative_path, "system")?;
     }

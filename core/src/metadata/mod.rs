@@ -38,7 +38,8 @@ pub fn title_precedence_sql() -> &'static str {
 
 pub fn hidden_entity_sql(entity_alias: &str) -> String {
     format!(
-        "NOT EXISTS (
+        "{entity_alias}.status != 'user_deleted'
+        AND NOT EXISTS (
             SELECT 1 FROM metadata hidden
             WHERE hidden.entity_id = {entity_alias}.id
               AND hidden.key = 'visibility'

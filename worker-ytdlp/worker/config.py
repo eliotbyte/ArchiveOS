@@ -15,10 +15,12 @@ class Config:
     ytdlp_auto_update: bool
     ytdlp_update_interval_secs: int
     ytdlp_playlist_max_items: int | None
+    ytdlp_cookies_path: str | None
 
     @classmethod
     def from_env(cls) -> Config:
-        max_items_raw = os.environ.get("YTDLP_PLAYLIST_MAX_ITEMS")
+        max_items_raw = os.environ.get("YTDLP_PLAYLIST_MAX_ITEMS")  # optional dev cap; unset = full playlist
+        cookies = os.environ.get("YTDLP_COOKIES_PATH")
         return cls(
             core_url=os.environ.get("CORE_URL", "http://core:8080").rstrip("/"),
             vault_name=os.environ["VAULT_NAME"],
@@ -31,6 +33,7 @@ class Config:
                 os.environ.get("YTDLP_UPDATE_INTERVAL_SECS", "86400")
             ),
             ytdlp_playlist_max_items=int(max_items_raw) if max_items_raw else None,
+            ytdlp_cookies_path=cookies if cookies else None,
         )
 
 

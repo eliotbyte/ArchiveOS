@@ -1,4 +1,4 @@
-use archiveos_contract::VaultError;
+use archiveos_contract::{SubscriptionOptions, VaultError, YtdlpJobInput};
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -15,6 +15,7 @@ pub struct SourceSubscription {
     pub last_checked_at: Option<String>,
     pub status: String,
     pub created_at: String,
+    pub options: Option<SubscriptionOptions>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +25,7 @@ pub struct CreateSubscriptionInput {
     pub url: String,
     pub target_vault: String,
     pub interval_minutes: i32,
+    pub options: Option<SubscriptionOptions>,
 }
 
 pub fn create_subscription(
@@ -35,11 +37,17 @@ pub fn create_subscription(
     let created_at = now.to_rfc3339();
     let next_run_at = now.to_rfc3339();
 
+    let options_json = input
+        .options
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
     conn.execute(
         "INSERT INTO source_subscription (
             id, source, kind, url, target_vault, interval_minutes,
-            next_run_at, last_checked_at, status, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'active', ?8)",
+            next_run_at, last_checked_at, status, created_at, options_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, 'active', ?8, ?9)",
         params![
             id.to_string(),
             input.source,
@@ -49,6 +57,7 @@ pub fn create_subscription(
             input.interval_minutes,
             next_run_at,
             created_at,
+            options_json,
         ],
     )
     .map_err(db_err)?;
@@ -60,7 +69,7 @@ pub fn list_subscriptions(conn: &Connection) -> Result<Vec<SourceSubscription>, 
     let mut stmt = conn
         .prepare(
             "SELECT id, source, kind, url, target_vault, interval_minutes,
-                    next_run_at, last_checked_at, status, created_at
+                    next_run_at, last_checked_at, status, created_at, options_json
              FROM source_subscription
              ORDER BY created_at DESC",
         )
@@ -84,7 +93,7 @@ pub fn due_subscriptions(conn: &Connection) -> Result<Vec<SourceSubscription>, V
     let mut stmt = conn
         .prepare(
             "SELECT id, source, kind, url, target_vault, interval_minutes,
-                    next_run_at, last_checked_at, status, created_at
+                    next_run_at, last_checked_at, status, created_at, options_json
              FROM source_subscription
              WHERE status = 'active' AND next_run_at <= ?1
              ORDER BY next_run_at ASC",
@@ -120,7 +129,7 @@ pub fn mark_subscription_checked(
 pub fn get_subscription(conn: &Connection, id: Uuid) -> Result<Option<SourceSubscription>, VaultError> {
     conn.query_row(
         "SELECT id, source, kind, url, target_vault, interval_minutes,
-                next_run_at, last_checked_at, status, created_at
+                next_run_at, last_checked_at, status, created_at, options_json
          FROM source_subscription WHERE id = ?1",
         [id.to_string()],
         map_subscription,
@@ -143,7 +152,33 @@ fn map_subscription(row: &rusqlite::Row<'_>) -> rusqlite::Result<SourceSubscript
         last_checked_at: row.get(7)?,
         status: row.get(8)?,
         created_at: row.get(9)?,
+        options: parse_options(row.get(10)?)?,
     })
+}
+
+fn parse_options(raw: Option<String>) -> rusqlite::Result<Option<SubscriptionOptions>> {
+    match raw {
+        Some(json) if !json.is_empty() => serde_json::from_str(&json).map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
+        }),
+        _ => Ok(None),
+    }
+}
+
+pub fn subscription_job_input(sub: &SourceSubscription) -> Result<String, VaultError> {
+    let options = sub.options.clone().unwrap_or_default();
+    YtdlpJobInput {
+        url: sub.url.clone(),
+        mode: "subscription".into(),
+        resync: options.resync,
+        removed_items: options.removed_items,
+        asset_policy: options.asset_policy,
+    }
+    .to_json()
 }
 
 fn db_err(err: rusqlite::Error) -> VaultError {
@@ -172,6 +207,7 @@ mod tests {
                 url: "https://youtube.com/playlist?list=PLtest".into(),
                 target_vault: "archiveos".into(),
                 interval_minutes: 60,
+                options: None,
             },
         )
         .unwrap();
@@ -195,6 +231,7 @@ mod tests {
                 url: "https://youtube.com/playlist?list=PLtest".into(),
                 target_vault: "archiveos".into(),
                 interval_minutes: 30,
+                options: None,
             },
         )
         .unwrap();
@@ -205,5 +242,34 @@ mod tests {
         mark_subscription_checked(conn, sub.id, sub.interval_minutes).unwrap();
         let due_after = due_subscriptions(conn).unwrap();
         assert!(due_after.is_empty());
+    }
+
+    #[test]
+    fn subscription_job_input_uses_structured_json() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+        let sub = create_subscription(
+            conn,
+            &CreateSubscriptionInput {
+                source: "youtube".into(),
+                kind: "playlist".into(),
+                url: "https://youtube.com/playlist?list=PLtest".into(),
+                target_vault: "archiveos".into(),
+                interval_minutes: 30,
+                options: Some(SubscriptionOptions {
+                    resync: true,
+                    removed_items: "mark_removed".into(),
+                    asset_policy: archiveos_contract::AssetPolicy {
+                        video: "best_1080p".into(),
+                        ..Default::default()
+                    },
+                }),
+            },
+        )
+        .unwrap();
+        let raw = subscription_job_input(&sub).unwrap();
+        assert!(raw.contains("subscription"));
+        assert!(raw.contains("best_1080p"));
     }
 }

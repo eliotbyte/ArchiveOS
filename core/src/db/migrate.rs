@@ -58,6 +58,36 @@ pub fn migrate(conn: &Connection) -> Result<(), VaultError> {
             .map_err(db_err)?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![4, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 4 {
+        conn.execute_batch(include_str!("../../migrations/005_entity_assets.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![5, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 5 {
+        conn.execute_batch(include_str!("../../migrations/006_entity_asset_metadata.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![6, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 6 {
+        conn.execute_batch(include_str!("../../migrations/007_subscription_options.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![DB_SCHEMA_VERSION, Utc::now().to_rfc3339()],
         )
         .map_err(db_err)?;
@@ -110,6 +140,8 @@ mod tests {
         migrate(&conn).unwrap();
         for table in [
             "entity",
+            "entity_asset",
+            "entity_asset_metadata",
             "source_ref",
             "metadata",
             "tag",
@@ -149,6 +181,53 @@ mod tests {
         let count: i32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM pragma_table_info('collection') WHERE name = 'content_fingerprint'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrate_v5_adds_asset_and_membership_lifecycle() {
+        let conn = in_memory_conn();
+        migrate(&conn).unwrap();
+
+        let asset_columns: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entity_asset')
+                 WHERE name IN ('role', 'kind', 'content_hash', 'status', 'storage_strategy')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(asset_columns, 5);
+
+        let membership_columns: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('collection_member')
+                 WHERE name IN ('status', 'first_seen_at', 'last_seen_at', 'removed_at')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(membership_columns, 4);
+    }
+
+    #[test]
+    fn migrate_v6_adds_entity_asset_metadata_table() {
+        let conn = in_memory_conn();
+        migrate(&conn).unwrap();
+        assert!(table_exists(&conn, "entity_asset_metadata").unwrap());
+    }
+
+    #[test]
+    fn migrate_v7_adds_subscription_options_json() {
+        let conn = in_memory_conn();
+        migrate(&conn).unwrap();
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('source_subscription') WHERE name = 'options_json'",
                 [],
                 |row| row.get(0),
             )

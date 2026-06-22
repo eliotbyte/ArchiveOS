@@ -12,52 +12,55 @@ class DownloadError(RuntimeError):
     pass
 
 
-def probe_video(video_id: str) -> dict[str, Any]:
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    result = subprocess.run(
-        [
-            "yt-dlp",
-            "--dump-single-json",
-            "--skip-download",
-            "--no-warnings",
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def probe_video(url: str, *, extra_args: list[str] | None = None) -> dict[str, Any]:
+    cmd = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--skip-download",
+        "--no-warnings",
+        *(extra_args or []),
+        url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise DownloadError(result.stderr.strip() or "yt-dlp video probe failed")
     return json.loads(result.stdout)
 
 
-def download_video(video_id: str, output_dir: Path) -> tuple[Path | None, dict[str, Any] | None, str | None]:
+def download_video(
+    url: str,
+    video_id: str,
+    output_dir: Path,
+    *,
+    format_selector: str | None = "bv*+ba/b",
+    extra_args: list[str] | None = None,
+) -> tuple[Path | None, dict[str, Any] | None, str | None]:
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        info = probe_video(video_id)
+        info = probe_video(url, extra_args=extra_args)
     except DownloadError as err:
         return None, None, str(err)
 
-    url = info.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+    if format_selector is None:
+        return None, info, None
+
+    page_url = info.get("webpage_url") or url
     template = str(output_dir / f"{video_id}.%(ext)s")
-    result = subprocess.run(
-        [
-            "yt-dlp",
-            "-f",
-            "bv*+ba/b",
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            template,
-            "--write-info-json",
-            "--no-overwrites",
-            "--no-warnings",
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    cmd = [
+        "yt-dlp",
+        "-f",
+        format_selector,
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        template,
+        "--write-info-json",
+        "--no-overwrites",
+        "--no-warnings",
+        *(extra_args or []),
+        page_url,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
 
     info_path = output_dir / f"{video_id}.info.json"
     if info_path.exists():
