@@ -8,12 +8,16 @@ import {
   mediaKindFromEntity,
   type EntityDetail,
 } from "../api/client";
-import { useVault } from "../context/VaultContext";
 import AssetList from "../components/AssetList";
+import { useVideoPlayer } from "../context/VideoPlayerContext";
+import { useVault } from "../context/VaultContext";
+import { queueItemFromDetail } from "../player/queue";
 
 export default function EntityPage() {
   const { id } = useParams();
   const { api, assetContentUrl } = useVault();
+  const { playEntity, queue, registerFullPlayerAnchor, setActiveEntityAssets } =
+    useVideoPlayer();
   const [entity, setEntity] = useState<EntityDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -37,6 +41,22 @@ export default function EntityPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    if (!entity || !id) return;
+    setActiveEntityAssets(entity.assets);
+    const primary = entity.assets.find((asset) => asset.role === "primary");
+    const mediaKind = mediaKindFromEntity(primary?.kind, primary?.mime ?? entity.mime);
+    if (mediaKind !== "video") return;
+    if (!queueItemFromDetail(entity)) return;
+    if (!queue.items.some((item) => item.entityId === id)) {
+      playEntity(entity);
+    }
+  }, [entity, id, queue.items, playEntity, setActiveEntityAssets]);
+
+  useEffect(() => {
+    return () => registerFullPlayerAnchor(null);
+  }, [id, registerFullPlayerAnchor]);
 
   async function regeneratePreviews() {
     if (!entity) return;
@@ -67,18 +87,15 @@ export default function EntityPage() {
   const display = browserDisplayState(primary?.mime ?? entity.mime);
   const canPlay =
     primary && primary.status === "present" && display === "supported";
+  const showVideoAnchor = canPlay && mediaKind === "video";
 
   return (
     <article className="viewer-page">
-      <section className="viewer-stage">
-        {canPlay && mediaKind === "video" ? (
-          <video
-            className="viewer-video"
-            controls
-            playsInline
-            src={assetContentUrl(primary.id)}
-          />
-        ) : canPlay && mediaKind === "image" ? (
+      <section
+        ref={showVideoAnchor ? registerFullPlayerAnchor : undefined}
+        className={`viewer-stage${showVideoAnchor ? " viewer-stage-video" : ""}`}
+      >
+        {showVideoAnchor ? null : canPlay && mediaKind === "image" ? (
           <img
             className="viewer-image"
             src={assetContentUrl(primary.id)}

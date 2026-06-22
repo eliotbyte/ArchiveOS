@@ -22,7 +22,7 @@ export default function PlaylistsPage() {
         setSelectedId(result[0]?.id ?? null);
         setError(null);
       } catch (err) {
-        setError(err instanceof ApiError ? err.message : "Failed to load playlists");
+        setError(err instanceof ApiError ? err.message : "Failed to load collections");
       } finally {
         setLoading(false);
       }
@@ -52,17 +52,17 @@ export default function PlaylistsPage() {
   return (
     <section className="detail-grid">
       <div className="page-header">
-        <h2>Playlists</h2>
+        <h2>Collections</h2>
         <p className="subtitle">
-          Source playlists, channels, and folder collections from your vault.
+          Playlists, channels, folders, and other grouped lists from your vault.
         </p>
       </div>
 
-      {loading ? <div className="loading-state">Loading playlists...</div> : null}
+      {loading ? <div className="loading-state">Loading collections...</div> : null}
       {error ? <div className="error-state">{error}</div> : null}
 
       {!loading && collections.length === 0 ? (
-        <div className="empty-state panel">No playlists or collections yet.</div>
+        <div className="empty-state panel">No collections yet.</div>
       ) : null}
 
       {collections.length > 0 ? (

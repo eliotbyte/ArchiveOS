@@ -101,8 +101,27 @@ export function createApi(vaultName: string) {
         `/vaults/${vaultName}/search?${new URLSearchParams({ query }).toString()}`,
       ),
 
-    listCollections: () =>
-      request<CollectionSummary[]>(`/vaults/${vaultName}/collections`),
+    listCollections: (
+      params: {
+        type?: string;
+        min_member_count?: number;
+      } = {},
+    ) => {
+      const query = new URLSearchParams();
+      if (params.type) query.set("type", params.type);
+      if (params.min_member_count !== undefined) {
+        query.set("min_member_count", String(params.min_member_count));
+      }
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return request<CollectionSummary[]>(
+        `/vaults/${vaultName}/collections${suffix}`,
+      );
+    },
+
+    getCollection: (collectionId: string) =>
+      request<CollectionDetail>(
+        `/vaults/${vaultName}/collections/${collectionId}`,
+      ),
 
     listCollectionMembers: (collectionId: string) =>
       request<CollectionMemberItem[]>(
@@ -234,6 +253,9 @@ export interface EntityListItem {
   timeline_manifest?: EntityPreviewSummary | null;
   primary_asset_id?: string | null;
   primary_asset_status?: string | null;
+  channel?: string | null;
+  uploader?: string | null;
+  duration?: string | null;
 }
 
 export interface CollectionSummary {
@@ -241,15 +263,35 @@ export interface CollectionSummary {
   collection_type: string;
   title: string;
   member_count: number;
+  cover_preview?: EntityPreviewSummary | null;
+}
+
+export interface CollectionDetail {
+  id: string;
+  collection_type: string;
+  title: string;
+  member_count: number;
+  cover_preview?: EntityPreviewSummary | null;
+  members: CollectionMemberItem[];
 }
 
 export interface CollectionMemberItem {
   id: string;
   title?: string | null;
   kind?: string | null;
+  mime?: string | null;
+  source?: string | null;
   status: string;
   position: number;
   preview?: EntityPreviewSummary | null;
+  timeline_sprite?: EntityPreviewSummary | null;
+  timeline_manifest?: EntityPreviewSummary | null;
+  primary_asset_id?: string | null;
+  primary_asset_status?: string | null;
+  duration?: string | null;
+  channel?: string | null;
+  uploader?: string | null;
+  webpage_url?: string | null;
 }
 
 export interface EntityHit {

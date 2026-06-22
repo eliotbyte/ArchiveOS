@@ -127,7 +127,25 @@ fn build_browse_sql(query: &BrowseQuery, limit: i64) -> (String, Vec<Box<dyn ToS
                     WHERE ea.entity_id = e.id AND ea.role = 'primary'
                     ORDER BY ea.created_at ASC
                     LIMIT 1
-                ) AS primary_kind
+                ) AS primary_kind,
+                (
+                    SELECT m.value FROM metadata m
+                    WHERE m.entity_id = e.id AND m.key = 'channel'
+                    ORDER BY {title_order}
+                    LIMIT 1
+                ) AS channel,
+                (
+                    SELECT m.value FROM metadata m
+                    WHERE m.entity_id = e.id AND m.key = 'uploader'
+                    ORDER BY {title_order}
+                    LIMIT 1
+                ) AS uploader,
+                (
+                    SELECT m.value FROM metadata m
+                    WHERE m.entity_id = e.id AND m.key = 'duration'
+                    ORDER BY {title_order}
+                    LIMIT 1
+                ) AS duration
          FROM entity e
          WHERE {filters}{hidden}
          ORDER BY e.added_at DESC
@@ -147,6 +165,9 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<EntityListItem> {
     let primary_asset_id: Option<String> = row.get(5)?;
     let primary_asset_status: Option<String> = row.get(6)?;
     let kind: Option<String> = row.get(7)?;
+    let channel: Option<String> = row.get(8)?;
+    let uploader: Option<String> = row.get(9)?;
+    let duration: Option<String> = row.get(10)?;
 
     Ok(EntityListItem {
         id: Uuid::parse_str(&id).map_err(|e| {
@@ -172,6 +193,9 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<EntityListItem> {
         primary_asset_status,
         timeline_sprite: None,
         timeline_manifest: None,
+        channel,
+        uploader,
+        duration,
     })
 }
 
@@ -294,6 +318,26 @@ mod tests {
         .unwrap();
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].id, entity_id);
+    }
+
+    #[test]
+    fn browse_includes_channel_uploader_and_duration_metadata() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+        let entity_id = Uuid::new_v4();
+
+        insert_present_video(conn, entity_id, "present");
+        upsert_metadata(conn, entity_id, "title", "Cool Video", "yt-dlp").unwrap();
+        upsert_metadata(conn, entity_id, "channel", "Test Channel", "yt-dlp").unwrap();
+        upsert_metadata(conn, entity_id, "uploader", "Test Uploader", "yt-dlp").unwrap();
+        upsert_metadata(conn, entity_id, "duration", "125", "yt-dlp").unwrap();
+
+        let items = browse(conn, &BrowseQuery::recent(10)).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].channel.as_deref(), Some("Test Channel"));
+        assert_eq!(items[0].uploader.as_deref(), Some("Test Uploader"));
+        assert_eq!(items[0].duration.as_deref(), Some("125"));
     }
 
     #[test]

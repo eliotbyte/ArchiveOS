@@ -8,7 +8,7 @@ interface AppShellProps {
 
 const NAV_ITEMS = [
   { to: "/", label: "Library", end: true },
-  { to: "/playlists", label: "Playlists", end: false },
+  { to: "/playlists", label: "Collections", end: false },
   { to: "/integrations", label: "Integrations", end: false },
   { to: "/jobs", label: "Jobs", end: false },
 ] as const;

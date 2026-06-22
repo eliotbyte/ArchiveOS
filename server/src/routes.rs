@@ -60,6 +60,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vaults/{vault}/subscriptions/{id}", delete(delete_subscription))
         .route("/vaults/{vault}/capabilities", get(list_capabilities))
         .route("/vaults/{vault}/collections", get(list_collections))
+        .route("/vaults/{vault}/collections/{collection_id}", get(get_collection))
         .route(
             "/vaults/{vault}/collections/{collection_id}/members",
             get(list_collection_members),
@@ -935,6 +936,7 @@ struct CollectionSummaryResponse {
     collection_type: String,
     title: String,
     member_count: i32,
+    cover_preview: Option<EntityPreviewResponse>,
 }
 
 impl From<archiveos_core::collections::CollectionSummary> for CollectionSummaryResponse {
@@ -944,21 +946,73 @@ impl From<archiveos_core::collections::CollectionSummary> for CollectionSummaryR
             collection_type: value.collection_type,
             title: value.title,
             member_count: value.member_count,
+            cover_preview: value.cover_preview.map(preview_summary_response),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct CollectionListParams {
+    #[serde(rename = "type")]
+    collection_type: Option<String>,
+    min_member_count: Option<i32>,
 }
 
 async fn list_collections(
     State(state): State<Arc<AppState>>,
     Path(vault_name): Path<String>,
+    Query(params): Query<CollectionListParams>,
 ) -> ApiResult<Json<Vec<CollectionSummaryResponse>>> {
     let vault = open_vault(&state, &vault_name)?;
+    let query = archiveos_core::collections::CollectionQuery {
+        collection_type: params.collection_type,
+        min_member_count: params.min_member_count,
+    };
     Ok(Json(
         vault
-            .list_collections()?
+            .list_collections(&query)?
             .into_iter()
             .map(CollectionSummaryResponse::from)
             .collect(),
+    ))
+}
+
+#[derive(Serialize)]
+struct CollectionDetailResponse {
+    id: Uuid,
+    collection_type: String,
+    title: String,
+    member_count: i32,
+    cover_preview: Option<EntityPreviewResponse>,
+    members: Vec<CollectionMemberResponse>,
+}
+
+impl From<archiveos_core::collections::CollectionDetail> for CollectionDetailResponse {
+    fn from(value: archiveos_core::collections::CollectionDetail) -> Self {
+        Self {
+            id: value.id,
+            collection_type: value.collection_type,
+            title: value.title,
+            member_count: value.member_count,
+            cover_preview: value.cover_preview.map(preview_summary_response),
+            members: value
+                .members
+                .into_iter()
+                .map(CollectionMemberResponse::from)
+                .collect(),
+        }
+    }
+}
+
+async fn get_collection(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, collection_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<CollectionDetailResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(
+        vault
+            .get_collection(collection_id)?
+            .into(),
     ))
 }
 
@@ -967,9 +1021,29 @@ struct CollectionMemberResponse {
     id: Uuid,
     title: Option<String>,
     kind: Option<String>,
+    mime: Option<String>,
+    source: Option<String>,
     status: String,
     position: i32,
     preview: Option<EntityPreviewResponse>,
+    timeline_sprite: Option<EntityPreviewResponse>,
+    timeline_manifest: Option<EntityPreviewResponse>,
+    primary_asset_id: Option<Uuid>,
+    primary_asset_status: Option<String>,
+    duration: Option<String>,
+    channel: Option<String>,
+    uploader: Option<String>,
+    webpage_url: Option<String>,
+}
+
+fn preview_summary_response(preview: archiveos_contract::EntityPreviewSummary) -> EntityPreviewResponse {
+    EntityPreviewResponse {
+        entity_id: preview.entity_id,
+        asset_id: preview.asset_id,
+        kind: preview.kind,
+        preview_role: preview.preview_role,
+        status: preview.status,
+    }
 }
 
 impl From<archiveos_core::collections::CollectionMemberItem> for CollectionMemberResponse {
@@ -978,15 +1052,19 @@ impl From<archiveos_core::collections::CollectionMemberItem> for CollectionMembe
             id: value.id,
             title: value.title,
             kind: value.kind,
+            mime: value.mime,
+            source: value.source,
             status: value.status,
             position: value.position,
-            preview: value.preview.map(|preview| EntityPreviewResponse {
-                entity_id: preview.entity_id,
-                asset_id: preview.asset_id,
-                kind: preview.kind,
-                preview_role: preview.preview_role,
-                status: preview.status,
-            }),
+            preview: value.preview.map(preview_summary_response),
+            timeline_sprite: value.timeline_sprite.map(preview_summary_response),
+            timeline_manifest: value.timeline_manifest.map(preview_summary_response),
+            primary_asset_id: value.primary_asset_id,
+            primary_asset_status: value.primary_asset_status,
+            duration: value.duration,
+            channel: value.channel,
+            uploader: value.uploader,
+            webpage_url: value.webpage_url,
         }
     }
 }

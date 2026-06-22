@@ -218,8 +218,18 @@ impl Vault {
         crate::preview::commit_preview_files(self, job_id, entity_id, files)
     }
 
-    pub fn list_collections(&self) -> Result<Vec<crate::collections::CollectionSummary>, VaultError> {
-        crate::collections::list_collections(self.connection())
+    pub fn list_collections(
+        &self,
+        query: &crate::collections::CollectionQuery,
+    ) -> Result<Vec<crate::collections::CollectionSummary>, VaultError> {
+        crate::collections::list_collections(self.connection(), query)
+    }
+
+    pub fn get_collection(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<crate::collections::CollectionDetail, VaultError> {
+        crate::collections::get_collection(self.connection(), collection_id)
     }
 
     pub fn list_collection_members(

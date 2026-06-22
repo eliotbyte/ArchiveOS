@@ -35,6 +35,12 @@ pub struct EntityListItem {
     pub timeline_manifest: Option<EntityPreviewSummary>,
     pub primary_asset_id: Option<Uuid>,
     pub primary_asset_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uploader: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
