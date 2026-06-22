@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use archiveos_contract::{AssetPolicy, ImportManifest, ImportStrategy, SearchQuery, SubscriptionOptions, VaultRegistryEntry, YtdlpJobInput};
+use archiveos_contract::{AssetPolicy, BrowseQuery, ImportManifest, ImportStrategy, SearchQuery, SubscriptionOptions, VaultRegistryEntry, YtdlpJobInput};
 use archiveos_core::{open_vault_ref, Vault};
 use axum::extract::{Path, Query, State};
 use axum::routing::{delete, get, post};
@@ -16,6 +16,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/health", get(health))
         .route("/vaults", get(list_vaults).post(register_vault))
         .route("/vaults/{name}", delete(unregister_vault))
+        .route("/vaults/{vault}/entities", get(list_entities))
         .route("/vaults/{vault}/entities/{id}", get(get_entity).delete(delete_entity))
         .route(
             "/vaults/{vault}/entities/{id}/assets/{asset_id}",
@@ -28,6 +29,10 @@ pub fn router() -> Router<Arc<AppState>> {
         .route(
             "/vaults/{vault}/entities/{id}/assets/{asset_id}/commit",
             post(commit_asset),
+        )
+        .route(
+            "/vaults/{vault}/assets/{asset_id}/content",
+            get(crate::media::asset_content),
         )
         .route("/vaults/{vault}/reconcile/assets", post(reconcile_assets))
         .route(
@@ -101,7 +106,7 @@ async fn unregister_vault(
     Ok(Json(serde_json::json!({ "removed": name })))
 }
 
-fn open_vault(state: &AppState, vault: &str) -> Result<Vault, ApiError> {
+pub(crate) fn open_vault(state: &AppState, vault: &str) -> Result<Vault, ApiError> {
     let registry = state.registry()?;
     Ok(open_vault_ref(Some(&registry), vault)?)
 }
@@ -286,6 +291,39 @@ impl From<archiveos_core::assets::EntityAssetWithMetadata> for EntityAssetRespon
             metadata_entries: item.metadata_entries,
         }
     }
+}
+
+#[derive(Deserialize)]
+struct BrowseParams {
+    query: Option<String>,
+    kind: Option<String>,
+    source: Option<String>,
+    status: Option<String>,
+    #[serde(default = "default_browse_limit")]
+    limit: u32,
+    #[serde(default)]
+    include_hidden: bool,
+}
+
+fn default_browse_limit() -> u32 {
+    50
+}
+
+async fn list_entities(
+    State(state): State<Arc<AppState>>,
+    Path(vault): Path<String>,
+    Query(params): Query<BrowseParams>,
+) -> ApiResult<Json<Vec<archiveos_contract::EntityListItem>>> {
+    let vault = open_vault(&state, &vault)?;
+    let items = vault.browse(&BrowseQuery {
+        text: params.query,
+        kind: params.kind,
+        source: params.source,
+        status: params.status,
+        limit: params.limit,
+        include_hidden: params.include_hidden,
+    })?;
+    Ok(Json(items))
 }
 
 #[derive(Deserialize)]

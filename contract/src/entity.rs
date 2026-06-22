@@ -11,6 +11,29 @@ pub struct EntityHit {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityPreviewSummary {
+    pub entity_id: Uuid,
+    pub asset_id: Uuid,
+    pub kind: String,
+    pub preview_role: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityListItem {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub mime: Option<String>,
+    pub kind: Option<String>,
+    pub status: String,
+    pub source: Option<String>,
+    pub tags: Vec<String>,
+    pub preview: Option<EntityPreviewSummary>,
+    pub primary_asset_id: Option<Uuid>,
+    pub primary_asset_status: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetadataEntry {
     pub key: String,
     pub value: String,
@@ -21,6 +44,16 @@ pub struct MetadataEntry {
 pub struct SearchQuery {
     pub tag: Option<String>,
     pub text: Option<String>,
+    pub include_hidden: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BrowseQuery {
+    pub text: Option<String>,
+    pub kind: Option<String>,
+    pub source: Option<String>,
+    pub status: Option<String>,
+    pub limit: u32,
     pub include_hidden: bool,
 }
 
@@ -38,6 +71,15 @@ impl SearchQuery {
             tag: None,
             text: Some(query.into()),
             include_hidden: false,
+        }
+    }
+}
+
+impl BrowseQuery {
+    pub fn recent(limit: u32) -> Self {
+        Self {
+            limit,
+            ..Self::default()
         }
     }
 }

@@ -141,7 +141,11 @@ class Worker:
             if asset is None:
                 raise TrackDownloadError(f"asset {asset_id} not found on entity {entity_id}")
 
-            file_path = download_track_asset(asset, files_dir)
+            file_path = download_track_asset(
+                asset,
+                files_dir,
+                extra_args=cookies_args(self.config),
+            )
             rel_path = relative_staging_path(files_dir, file_path)
             result = self.client.commit_asset(entity_id, asset_id, job_id, rel_path)
             logger.info("asset job %s finished: %s", job_id, result)

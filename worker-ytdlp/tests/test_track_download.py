@@ -59,10 +59,10 @@ def test_download_audio_asset_builds_ytdlp_command(tmp_path: Path):
 
     with patch("worker.track_download.subprocess.run") as run:
         run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-        out = download_audio_asset(asset, tmp_path)
+        out = download_audio_asset(asset, tmp_path, extra_args=["--cookies", "/cookies.txt"])
 
     cmd = run.call_args.args[0]
-    assert cmd[:4] == ["yt-dlp", "-f", "140", "--no-playlist"]
+    assert cmd[:5] == ["yt-dlp", "--cookies", "/cookies.txt", "-f", "140"]
     assert cmd[-1] == "https://youtube.com/watch?v=abc"
     assert out == out_file
 
@@ -88,9 +88,12 @@ def test_process_asset_job_success(tmp_path: Path):
         ytdlp_auto_update=False,
         ytdlp_update_on_start=False,
         ytdlp_update_interval_secs=3600,
-            ytdlp_playlist_max_items=0,
-            ytdlp_cookies_path=None,
-        )
+        ytdlp_playlist_max_items=0,
+        ytdlp_cookies_path=None,
+        ytdlp_worker_dir=str(tmp_path / "workers" / "ytdlp"),
+        ytdlp_cache_dir=str(tmp_path / "workers" / "ytdlp" / "cache"),
+        ytdlp_cookies_dir=str(tmp_path / "workers" / "ytdlp" / "cookies"),
+    )
     worker = Worker(config)
     worker.client = MagicMock()
     worker.client.get_entity.return_value = {
@@ -135,9 +138,12 @@ def test_process_asset_job_missing_asset_records_failure(tmp_path: Path):
         ytdlp_auto_update=False,
         ytdlp_update_on_start=False,
         ytdlp_update_interval_secs=3600,
-            ytdlp_playlist_max_items=0,
-            ytdlp_cookies_path=None,
-        )
+        ytdlp_playlist_max_items=0,
+        ytdlp_cookies_path=None,
+        ytdlp_worker_dir=str(tmp_path / "workers" / "ytdlp"),
+        ytdlp_cache_dir=str(tmp_path / "workers" / "ytdlp" / "cache"),
+        ytdlp_cookies_dir=str(tmp_path / "workers" / "ytdlp" / "cookies"),
+    )
     worker = Worker(config)
     worker.client = MagicMock()
     worker.client.get_entity.return_value = {"assets": []}

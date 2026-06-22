@@ -1,6 +1,10 @@
 services:
   core:
-    build: .
+    build:
+      context: .
+      args:
+        VITE_VAULT_NAME: default
+        VITE_API_BASE: ""
     ports:
       - "8080:8080"
     volumes:
@@ -9,6 +13,7 @@ services:
     environment:
       ARCHIVEOS_CONFIG: /config
       ARCHIVEOS_LISTEN: 0.0.0.0:8080
+      ARCHIVEOS_WEB_DIR: /usr/share/archiveos/web
 
   ytdlp-worker:
     build: ./worker-ytdlp

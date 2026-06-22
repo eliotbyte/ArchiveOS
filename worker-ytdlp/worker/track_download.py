@@ -57,7 +57,11 @@ def download_subtitle_asset(asset: dict[str, Any], files_dir: Path) -> Path:
     return out_path
 
 
-def download_audio_asset(asset: dict[str, Any], files_dir: Path) -> Path:
+def download_audio_asset(
+    asset: dict[str, Any],
+    files_dir: Path,
+    extra_args: list[str] | None = None,
+) -> Path:
     metadata = _metadata_map(asset)
     format_id = metadata.get("format_id")
     source_page_url = metadata.get("source_page_url")
@@ -70,6 +74,7 @@ def download_audio_asset(asset: dict[str, Any], files_dir: Path) -> Path:
     output_template = str(files_dir / f"{asset_id}.%(ext)s")
     cmd = [
         "yt-dlp",
+        *(extra_args or []),
         "-f",
         format_id,
         "--no-playlist",
@@ -89,13 +94,17 @@ def download_audio_asset(asset: dict[str, Any], files_dir: Path) -> Path:
     return matches[0]
 
 
-def download_track_asset(asset: dict[str, Any], files_dir: Path) -> Path:
+def download_track_asset(
+    asset: dict[str, Any],
+    files_dir: Path,
+    extra_args: list[str] | None = None,
+) -> Path:
     kind = asset.get("kind")
     files_dir.mkdir(parents=True, exist_ok=True)
     if kind == "subtitle":
         return download_subtitle_asset(asset, files_dir)
     if kind == "audio":
-        return download_audio_asset(asset, files_dir)
+        return download_audio_asset(asset, files_dir, extra_args=extra_args)
     raise TrackDownloadError(f"unsupported asset kind for track download: {kind!r}")
 
 

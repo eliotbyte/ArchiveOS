@@ -15,4 +15,4 @@ pub use import::{
 };
 pub use metadata::VaultMetadata;
 pub use registry::{VaultRegistryEntry, VaultStatus};
-pub use entity::{EntityHit, MetadataEntry, SearchQuery};
+pub use entity::{BrowseQuery, EntityHit, EntityListItem, EntityPreviewSummary, MetadataEntry, SearchQuery};

@@ -12,6 +12,7 @@ from worker.thumbnails import (
     download_thumbnail,
     extension_from_url,
     thumbnail_external_id,
+    thumbnail_http_headers,
 )
 
 
@@ -86,3 +87,12 @@ def test_thumbnail_relation_shape():
 def test_with_thumbnail_metadata_adds_external_id():
     info = with_thumbnail_metadata({"title": "t"}, "vid1")
     assert info["thumbnail_external_id"] == "vid1:thumbnail"
+
+
+def test_thumbnail_http_headers_merges_ytdlp_headers():
+    headers = thumbnail_http_headers(
+        {"http_headers": {"Cookie": "abc=1", "Referer": "https://youtube.com"}}
+    )
+    assert headers["Cookie"] == "abc=1"
+    assert headers["Referer"] == "https://youtube.com"
+    assert "User-Agent" in headers

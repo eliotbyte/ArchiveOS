@@ -1,3 +1,5 @@
 /target
 /config/registry.sqlite
 /vaults
+/web/node_modules
+/web/dist

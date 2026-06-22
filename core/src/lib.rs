@@ -1,3 +1,4 @@
+pub mod browse;
 pub mod cas;
 pub mod assets;
 pub mod db;
@@ -22,5 +23,5 @@ pub use inbox::InboxReport;
 pub use registry::{open_vault_ref, Registry};
 pub use vault::Vault;
 
-pub use archiveos_contract::{EntityHit, MetadataEntry, SearchQuery};
+pub use archiveos_contract::{BrowseQuery, EntityHit, EntityListItem, EntityPreviewSummary, MetadataEntry, SearchQuery};
 pub use entity::EntityDetail;

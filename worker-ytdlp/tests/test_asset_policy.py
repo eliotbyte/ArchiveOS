@@ -47,5 +47,8 @@ def test_cookies_args_when_configured():
         ytdlp_update_interval_secs=3600,
         ytdlp_playlist_max_items=None,
         ytdlp_cookies_path="/vault/cookies.txt",
+        ytdlp_worker_dir="/vault/workers/ytdlp",
+        ytdlp_cache_dir="/vault/workers/ytdlp/cache",
+        ytdlp_cookies_dir="/vault/workers/ytdlp/cookies",
     )
     assert cookies_args(config) == ["--cookies", "/vault/cookies.txt"]

@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::cas::{self, CasStoreResult};
 use crate::db::{migrate, open_connection};
 use crate::layout::{
-    blob_path as layout_blob_path, is_dir_empty, staging_job_path, validate_layout,
+    blob_path as layout_blob_path, find_blob_path, is_dir_empty, staging_job_path,
+    thumbnail_worker_dir, validate_layout, worker_cache_dir, worker_cookies_dir, ytdlp_worker_dir,
 };
 
 pub struct Vault {
@@ -186,6 +187,77 @@ impl Vault {
 
     pub fn search(&self, query: &archiveos_contract::SearchQuery) -> Result<Vec<archiveos_contract::EntityHit>, VaultError> {
         crate::search::search(self.connection(), query)
+    }
+
+    pub fn browse(
+        &self,
+        query: &archiveos_contract::BrowseQuery,
+    ) -> Result<Vec<archiveos_contract::EntityListItem>, VaultError> {
+        crate::browse::browse(self.connection(), query)
+    }
+
+    pub fn resolve_asset_content_path(
+        &self,
+        asset_id: Uuid,
+    ) -> Result<(PathBuf, String), VaultError> {
+        let asset = crate::assets::get_asset(self.connection(), asset_id)?;
+        if asset.status != "present" {
+            return Err(VaultError::InvalidLayout {
+                detail: format!(
+                    "asset {asset_id} is not present (status={})",
+                    asset.status
+                ),
+            });
+        }
+
+        let mime = asset
+            .mime
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".into());
+
+        match asset.storage_strategy.as_str() {
+            "managed" => {
+                let hash = asset.content_hash.ok_or_else(|| VaultError::InvalidLayout {
+                    detail: format!("managed asset {asset_id} missing content_hash"),
+                })?;
+                let path = find_blob_path(
+                    &self.root,
+                    &hash,
+                    asset.ext.as_deref(),
+                    Some(mime.as_str()),
+                )?;
+                Ok((path, mime))
+            }
+            "reference" => {
+                let path_str = asset.path.ok_or_else(|| VaultError::InvalidLayout {
+                    detail: format!("reference asset {asset_id} missing path"),
+                })?;
+                let path = PathBuf::from(&path_str);
+                if !path.is_file() {
+                    return Err(VaultError::NotFound);
+                }
+                Ok((path, mime))
+            }
+            other => Err(VaultError::InvalidLayout {
+                detail: format!("asset {asset_id} storage_strategy '{other}' is not readable"),
+            }),
+        }
+    }
+
+    pub fn ytdlp_worker_dir(&self) -> PathBuf {
+        ytdlp_worker_dir(&self.root)
+    }
+
+    pub fn ytdlp_cache_dir(&self) -> PathBuf {
+        worker_cache_dir(&self.root, archiveos_contract::WORKER_YTDLP)
+    }
+
+    pub fn ytdlp_cookies_dir(&self) -> PathBuf {
+        worker_cookies_dir(&self.root, archiveos_contract::WORKER_YTDLP)
+    }
+
+    pub fn thumbnail_worker_dir(&self) -> PathBuf {
+        thumbnail_worker_dir(&self.root)
     }
 
     pub fn get_entity(&self, entity_id: Uuid) -> Result<crate::entity::EntityDetail, VaultError> {

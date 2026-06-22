@@ -110,10 +110,16 @@ Existing endpoints remain:
 ## Worker Configuration
 
 ```env
-YTDLP_COOKIES_PATH=/vaults/archiveos/config/cookies.txt
+YTDLP_COOKIES_PATH=/vaults/archiveos/workers/ytdlp/cookies/youtube.txt
 ```
 
 When set, worker passes `--cookies` to yt-dlp probes and downloads.
+
+Default path when env unset:
+
+```text
+{vault}/workers/ytdlp/cookies/youtube.txt
+```
 
 ## Minimal Runbook
 

@@ -25,6 +25,14 @@ def best_thumbnail_url(info: dict[str, Any]) -> str | None:
     return info.get("thumbnail")
 
 
+def thumbnail_http_headers(info: dict[str, Any]) -> dict[str, str]:
+    headers = {"User-Agent": "ArchiveOS-ytdlp-worker/1.0"}
+    info_headers = info.get("http_headers")
+    if isinstance(info_headers, dict):
+        headers.update({str(k): str(v) for k, v in info_headers.items() if v is not None})
+    return headers
+
+
 def extension_from_url(url: str) -> str:
     path = urlparse(url).path.lower()
     for ext in ALLOWED_EXTENSIONS:
@@ -46,10 +54,7 @@ def download_thumbnail(
     ext = extension_from_url(url)
     output_path = output_dir / f"{video_id}{ext}"
 
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "ArchiveOS-ytdlp-worker/1.0"},
-    )
+    request = urllib.request.Request(url, headers=thumbnail_http_headers(info))
     try:
         with urllib.request.urlopen(request, timeout=60) as response:
             data = response.read()

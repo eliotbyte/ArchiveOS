@@ -1,6 +1,7 @@
 mod asset_reconcile_scheduler;
 mod error;
 mod inbox_watcher;
+mod media;
 mod routes;
 mod subscription_scheduler;
 
@@ -11,6 +12,8 @@ use std::sync::Arc;
 use archiveos_core::{Registry, Vault};
 use axum::Router;
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -65,14 +68,40 @@ async fn main() {
     }
 
     let state = Arc::new(AppState { config_dir });
-    let app = Router::new()
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+    let mut app = Router::new()
         .merge(routes::router())
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+
+    if let Some(web_dir) = web_static_dir() {
+        tracing::info!("serving web UI from {}", web_dir.display());
+        let index = web_dir.join("index.html");
+        app = app.fallback_service(
+            ServeDir::new(web_dir).not_found_service(ServeFile::new(index)),
+        );
+    } else {
+        tracing::info!("web UI static dir not found; API only");
+    }
 
     let listener = TcpListener::bind(addr).await.expect("bind failed");
     tracing::info!("listening on {addr}");
     axum::serve(listener, app).await.expect("server failed");
+}
+
+fn web_static_dir() -> Option<PathBuf> {
+    let dir = std::env::var("ARCHIVEOS_WEB_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/usr/share/archiveos/web"));
+    if dir.join("index.html").is_file() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 fn bootstrap_default_vault(config_dir: &PathBuf) -> Result<(), archiveos_contract::VaultError> {
