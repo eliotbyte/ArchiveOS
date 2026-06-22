@@ -33,7 +33,7 @@ pub fn ensure_inbox_dir(root: &Path) -> Result<PathBuf, VaultError> {
     Ok(inbox)
 }
 
-pub fn process_inbox(vault: &Vault) -> Result<InboxReport, VaultError> {
+pub fn process_inbox(vault: &Vault, target_vault: Option<&str>) -> Result<InboxReport, VaultError> {
     let inbox = ensure_inbox_dir(vault.root())?;
     let mut report = InboxReport::default();
     let mut entries: Vec<PathBuf> = fs::read_dir(&inbox)?
@@ -47,20 +47,25 @@ pub fn process_inbox(vault: &Vault) -> Result<InboxReport, VaultError> {
                 report.items_skipped += 1;
                 continue;
             }
-            import_file(vault, &path, None, &mut report)?;
+            import_file(vault, &path, None, target_vault, &mut report)?;
         } else if path.is_dir() {
             if should_skip_name(path.file_name()) {
                 report.items_skipped += 1;
                 continue;
             }
-            import_folder(vault, &path, &mut report)?;
+            import_folder(vault, &path, target_vault, &mut report)?;
         }
     }
 
     Ok(report)
 }
 
-fn import_folder(vault: &Vault, folder: &Path, report: &mut InboxReport) -> Result<(), VaultError> {
+fn import_folder(
+    vault: &Vault,
+    folder: &Path,
+    target_vault: Option<&str>,
+    report: &mut InboxReport,
+) -> Result<(), VaultError> {
     let leaves = discover_leaf_folders(folder).map_err(|err| VaultError::Io(err))?;
     if leaves.is_empty() {
         fs::remove_dir_all(folder)?;
@@ -68,7 +73,7 @@ fn import_folder(vault: &Vault, folder: &Path, report: &mut InboxReport) -> Resu
     }
 
     for leaf in leaves {
-        import_leaf_folder(vault, folder, &leaf, report)?;
+        import_leaf_folder(vault, folder, &leaf, target_vault, report)?;
     }
 
     fs::remove_dir_all(folder)?;
@@ -79,6 +84,7 @@ fn import_leaf_folder(
     vault: &Vault,
     drop_root: &Path,
     leaf: &LeafFolder,
+    target_vault: Option<&str>,
     report: &mut InboxReport,
 ) -> Result<(), VaultError> {
     let mut members = Vec::new();
@@ -86,7 +92,7 @@ fn import_leaf_folder(
 
     for (position, file_path) in leaf.files.iter().enumerate() {
         let file_source_path = file_source_path(drop_root, file_path);
-        let entity_id = import_file(vault, file_path, Some(&file_source_path), report)?;
+        let entity_id = import_file(vault, file_path, Some(&file_source_path), target_vault, report)?;
         members.push((entity_id, i32::try_from(position).unwrap_or(i32::MAX)));
 
         let hash: String = vault
@@ -178,6 +184,7 @@ fn import_file(
     vault: &Vault,
     file_path: &Path,
     source_relative_path: Option<&str>,
+    target_vault: Option<&str>,
     report: &mut InboxReport,
 ) -> Result<Uuid, VaultError> {
     let meta = fs::metadata(file_path)?;
@@ -218,12 +225,13 @@ fn import_file(
         db::upsert_metadata(conn, entity_id, "title", name, "inferred")?;
     }
     let asset_path = cas.blob_path.to_string_lossy().into_owned();
+    let asset_kind = crate::media::kind_from_mime(&mime);
     crate::assets::upsert_asset(
         conn,
         &UpsertAssetInput {
             entity_id,
             role: "primary",
-            kind: "file",
+            kind: asset_kind,
             content_hash: Some(&cas.content_hash),
             mime: Some(&mime),
             size: cas.size,
@@ -242,6 +250,10 @@ fn import_file(
         &image_meta,
         modified_at.as_deref(),
     )?;
+
+    if let Some(vault_name) = target_vault {
+        let _ = crate::preview::maybe_enqueue_preview_job(conn, vault_name, entity_id)?;
+    }
 
     Ok(entity_id)
 }
@@ -323,7 +335,7 @@ mod tests {
         let inbox = vault.inbox_dir();
         fs::write(inbox.join("photo.jpg"), b"jpeg-bytes").unwrap();
 
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
         assert_eq!(report.files_imported, 1);
         assert_eq!(report.collections_created, 0);
         assert!(fs::read_dir(inbox).unwrap().next().is_none());
@@ -331,6 +343,16 @@ mod tests {
             .into_iter()
             .filter_map(|e| e.ok())
             .any(|e| e.file_type().is_file()));
+
+        let kind: String = vault
+            .connection()
+            .query_row(
+                "SELECT kind FROM entity_asset WHERE role = 'primary' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "image");
     }
 
     #[test]
@@ -342,7 +364,7 @@ mod tests {
         fs::write(album.join("a.jpg"), b"a").unwrap();
         fs::write(album.join("b.jpg"), b"b").unwrap();
 
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
         assert_eq!(report.files_imported, 2);
         assert_eq!(report.collections_created, 1);
         assert!(!vault.inbox_dir().join("vacation").exists());
@@ -368,12 +390,12 @@ mod tests {
         let first = vault.inbox_dir().join("images/sort/album1");
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("peach.jpg"), b"same").unwrap();
-        process_inbox(&vault).unwrap();
+        process_inbox(&vault, None).unwrap();
 
         let second = vault.inbox_dir().join("images/album1");
         fs::create_dir_all(&second).unwrap();
         fs::write(second.join("peach.jpg"), b"same").unwrap();
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
 
         assert_eq!(report.collections_created, 0);
         assert_eq!(count_collections(&vault), 1);
@@ -400,12 +422,12 @@ mod tests {
         let first = vault.inbox_dir().join("album1");
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("peach.jpg"), b"peach").unwrap();
-        process_inbox(&vault).unwrap();
+        process_inbox(&vault, None).unwrap();
 
         let second = vault.inbox_dir().join("album1");
         fs::create_dir_all(&second).unwrap();
         fs::write(second.join("banana.jpg"), b"banana").unwrap();
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
 
         assert_eq!(report.collections_created, 1);
         assert_eq!(count_collections(&vault), 2);
@@ -421,7 +443,7 @@ mod tests {
         fs::write(root.join("folder2/a.jpg"), b"a").unwrap();
         fs::write(root.join("domik/b.jpg"), b"b").unwrap();
 
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
         assert_eq!(report.files_imported, 2);
         assert_eq!(report.collections_created, 2);
         assert_eq!(count_collections(&vault), 2);
@@ -448,13 +470,13 @@ mod tests {
         let first = vault.inbox_dir().join("album1");
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("a.jpg"), b"a").unwrap();
-        process_inbox(&vault).unwrap();
+        process_inbox(&vault, None).unwrap();
 
         let second = vault.inbox_dir().join("album1");
         fs::create_dir_all(&second).unwrap();
         fs::write(second.join("a.jpg"), b"a").unwrap();
         fs::write(second.join("b.jpg"), b"b").unwrap();
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
 
         assert_eq!(report.collections_created, 1);
         assert_eq!(count_collections(&vault), 2);
@@ -467,12 +489,12 @@ mod tests {
 
         let loose = vault.inbox_dir().join("dup.jpg");
         fs::write(&loose, b"same-bytes").unwrap();
-        process_inbox(&vault).unwrap();
+        process_inbox(&vault, None).unwrap();
 
         let album = vault.inbox_dir().join("my album");
         fs::create_dir_all(&album).unwrap();
         fs::write(album.join("dup.jpg"), b"same-bytes").unwrap();
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
 
         assert_eq!(report.files_imported, 0);
         assert_eq!(report.entities_reused, 1);
@@ -506,12 +528,12 @@ mod tests {
         let first = vault.inbox_dir().join("sort/vacation");
         fs::create_dir_all(&first).unwrap();
         fs::write(first.join("a.jpg"), b"a").unwrap();
-        process_inbox(&vault).unwrap();
+        process_inbox(&vault, None).unwrap();
 
         let second = vault.inbox_dir().join("vacation");
         fs::create_dir_all(&second).unwrap();
         fs::write(second.join("a.jpg"), b"a").unwrap();
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
 
         assert_eq!(report.collections_created, 0);
         assert_eq!(count_collections(&vault), 1);
@@ -533,7 +555,7 @@ mod tests {
         fs::write(vault.inbox_dir().join("Thumbs.db"), b"x").unwrap();
         fs::write(vault.inbox_dir().join("keep.png"), b"png").unwrap();
 
-        let report = process_inbox(&vault).unwrap();
+        let report = process_inbox(&vault, None).unwrap();
         assert_eq!(report.files_imported, 1);
         assert_eq!(report.items_skipped, 1);
         assert!(vault.inbox_dir().join("Thumbs.db").exists());

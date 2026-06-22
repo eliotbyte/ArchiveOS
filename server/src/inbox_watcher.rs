@@ -29,7 +29,7 @@ async fn run_once(
     tokio::task::spawn_blocking(move || {
         let registry = Registry::open(&config_dir)?;
         let vault = open_vault_ref(Some(&registry), &vault_name)?;
-        let report = vault.process_inbox()?;
+        let report = vault.process_inbox(Some(&vault_name))?;
         if report.files_imported > 0
             || report.collections_created > 0
             || report.items_skipped > 0

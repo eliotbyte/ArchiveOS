@@ -3,6 +3,7 @@ use rusqlite::{params_from_iter, Connection, Row, ToSql};
 use uuid::Uuid;
 
 use crate::entity::resolve_entity_preview;
+use crate::entity::{resolve_timeline_manifest, resolve_timeline_sprite};
 use crate::metadata;
 use crate::tags;
 
@@ -23,6 +24,10 @@ pub fn browse(conn: &Connection, query: &BrowseQuery) -> Result<Vec<EntityListIt
         item.tags = tags::list_entity_tags(conn, item.id)?;
         item.preview = resolve_entity_preview(conn, item.id)?
             .map(EntityPreviewSummary::from);
+        item.timeline_sprite = resolve_timeline_sprite(conn, item.id)?
+            .map(EntityPreviewSummary::from);
+        item.timeline_manifest = resolve_timeline_manifest(conn, item.id)?
+            .map(EntityPreviewSummary::from);
         items.push(item);
     }
 
@@ -42,7 +47,16 @@ fn build_browse_sql(query: &BrowseQuery, limit: i64) -> (String, Vec<Box<dyn ToS
     };
     let title_order = metadata::title_precedence_sql();
 
-    let mut filters = vec!["e.status != 'user_deleted'".to_string()];
+    let mut filters = vec![
+        "e.status != 'user_deleted'".to_string(),
+        "EXISTS (
+            SELECT 1 FROM entity_asset ea
+            WHERE ea.entity_id = e.id
+              AND ea.role = 'primary'
+              AND ea.status = 'present'
+        )"
+        .to_string(),
+    ];
     let mut bind_values: Vec<Box<dyn ToSql>> = Vec::new();
 
     if let Some(text) = &query.text {
@@ -156,19 +170,9 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<EntityListItem> {
                 )
             })?,
         primary_asset_status,
+        timeline_sprite: None,
+        timeline_manifest: None,
     })
-}
-
-impl From<crate::entity::EntityPreview> for EntityPreviewSummary {
-    fn from(preview: crate::entity::EntityPreview) -> Self {
-        Self {
-            entity_id: preview.entity_id,
-            asset_id: preview.asset_id,
-            kind: preview.kind,
-            preview_role: preview.preview_role,
-            status: preview.status,
-        }
-    }
 }
 
 fn db_err(err: rusqlite::Error) -> VaultError {
@@ -180,12 +184,34 @@ fn db_err(err: rusqlite::Error) -> VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::UpsertAssetInput;
     use crate::import::db::{insert_entity, upsert_metadata};
     use crate::tags::add_tag;
     use crate::Vault;
     use chrono::Utc;
     use tempfile::tempdir;
     use uuid::Uuid;
+
+    fn insert_present_video(conn: &rusqlite::Connection, entity_id: Uuid, status: &str) {
+        let now = Utc::now().to_rfc3339();
+        insert_entity(conn, entity_id, None, Some("video/mp4"), 0, status, &now, None).unwrap();
+        crate::assets::upsert_asset(
+            conn,
+            &UpsertAssetInput {
+                entity_id,
+                role: "primary",
+                kind: "video",
+                content_hash: Some("hash"),
+                mime: Some("video/mp4"),
+                size: 1,
+                ext: Some(".mp4"),
+                status: "present",
+                storage_strategy: "managed",
+                path: None,
+            },
+        )
+        .unwrap();
+    }
 
     #[test]
     fn browse_lists_recent_entities_without_search_params() {
@@ -195,9 +221,7 @@ mod tests {
 
         for (title, status) in [("Alpha", "present"), ("Beta", "active")] {
             let entity_id = Uuid::new_v4();
-            let now = Utc::now().to_rfc3339();
-            insert_entity(conn, entity_id, None, Some("video/mp4"), 0, status, &now, None)
-                .unwrap();
+            insert_present_video(conn, entity_id, status);
             upsert_metadata(conn, entity_id, "title", title, "user").unwrap();
         }
 
@@ -205,6 +229,26 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items.iter().any(|item| item.title.as_deref() == Some("Alpha")));
         assert!(items.iter().any(|item| item.title.as_deref() == Some("Beta")));
+    }
+
+    #[test]
+    fn browse_excludes_entities_without_present_primary_asset() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+        let channel_id = Uuid::new_v4();
+        let video_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+
+        insert_entity(conn, channel_id, None, None, 0, "present", &now, None).unwrap();
+        upsert_metadata(conn, channel_id, "title", "The Chalkeaters", "yt-dlp").unwrap();
+
+        insert_present_video(conn, video_id, "present");
+        upsert_metadata(conn, video_id, "title", "Real Video", "yt-dlp").unwrap();
+
+        let items = browse(conn, &BrowseQuery::recent(10)).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title.as_deref(), Some("Real Video"));
     }
 
     #[test]
@@ -216,6 +260,22 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         insert_entity(conn, entity_id, None, Some("image/webp"), 10, "present", &now, None)
             .unwrap();
+        crate::assets::upsert_asset(
+            conn,
+            &UpsertAssetInput {
+                entity_id,
+                role: "primary",
+                kind: "image",
+                content_hash: Some("img"),
+                mime: Some("image/webp"),
+                size: 10,
+                ext: Some(".webp"),
+                status: "present",
+                storage_strategy: "managed",
+                path: None,
+            },
+        )
+        .unwrap();
         upsert_metadata(conn, entity_id, "title", "Hidden Thumb", "yt-dlp").unwrap();
         upsert_metadata(conn, entity_id, "visibility", "hidden", "archiveos").unwrap();
         add_tag(conn, entity_id, "gallery").unwrap();
@@ -247,8 +307,25 @@ mod tests {
         let now = Utc::now().to_rfc3339();
         insert_entity(conn, cat, None, None, 0, "present", &now, None).unwrap();
         insert_entity(conn, dog, None, None, 0, "present", &now, None).unwrap();
-        upsert_metadata(conn, cat, "title", "Cute Cat", "user").unwrap();
-        upsert_metadata(conn, dog, "title", "Happy Dog", "user").unwrap();
+        for (entity_id, title) in [(cat, "Cute Cat"), (dog, "Happy Dog")] {
+            crate::assets::upsert_asset(
+                conn,
+                &UpsertAssetInput {
+                    entity_id,
+                    role: "primary",
+                    kind: "image",
+                    content_hash: Some(title),
+                    mime: Some("image/jpeg"),
+                    size: 1,
+                    ext: Some(".jpg"),
+                    status: "present",
+                    storage_strategy: "managed",
+                    path: None,
+                },
+            )
+            .unwrap();
+            upsert_metadata(conn, entity_id, "title", title, "user").unwrap();
+        }
 
         let hits = browse(
             conn,

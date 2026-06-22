@@ -1,10 +1,15 @@
 use std::collections::HashMap;
 
-use archiveos_contract::{MetadataEntry, VaultError};
+use archiveos_contract::{EntityPreviewSummary, MetadataEntry, VaultError};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
+use crate::assets::{self, find_asset_by_preview_role};
 use crate::metadata;
+use crate::preview::{
+    ROLE_PREVIEW_IMAGE_LARGE, ROLE_PREVIEW_IMAGE_SMALL, ROLE_TIMELINE_MANIFEST,
+    ROLE_TIMELINE_SPRITE,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityPreview {
@@ -13,6 +18,18 @@ pub struct EntityPreview {
     pub kind: String,
     pub preview_role: String,
     pub status: String,
+}
+
+impl From<EntityPreview> for EntityPreviewSummary {
+    fn from(preview: EntityPreview) -> Self {
+        Self {
+            entity_id: preview.entity_id,
+            asset_id: preview.asset_id,
+            kind: preview.kind,
+            preview_role: preview.preview_role,
+            status: preview.status,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +46,8 @@ pub struct EntityDetail {
     pub metadata_entries: Vec<MetadataEntry>,
     pub assets: Vec<crate::assets::EntityAssetWithMetadata>,
     pub preview: Option<EntityPreview>,
+    pub timeline_sprite: Option<EntityPreview>,
+    pub timeline_manifest: Option<EntityPreview>,
 }
 
 pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, VaultError> {
@@ -74,6 +93,8 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
     let metadata = metadata::flatten_metadata(&metadata_entries);
     let assets = crate::assets::list_assets_with_metadata(conn, id)?;
     let preview = resolve_entity_preview(conn, id)?;
+    let timeline_sprite = resolve_timeline_sprite(conn, id)?;
+    let timeline_manifest = resolve_timeline_manifest(conn, id)?;
 
     Ok(EntityDetail {
         id,
@@ -88,10 +109,101 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
         metadata_entries,
         assets,
         preview,
+        timeline_sprite,
+        timeline_manifest,
     })
 }
 
 pub fn resolve_entity_preview(
+    conn: &Connection,
+    entity_id: Uuid,
+) -> Result<Option<EntityPreview>, VaultError> {
+    let is_video = is_video_entity(conn, entity_id)?;
+
+    if is_video {
+        if let Some(preview) = resolve_source_thumbnail_preview(conn, entity_id)? {
+            return Ok(Some(preview));
+        }
+    }
+
+    if let Some(preview) =
+        preview_from_role(conn, entity_id, ROLE_PREVIEW_IMAGE_SMALL)?
+    {
+        return Ok(Some(preview));
+    }
+    if let Some(preview) =
+        preview_from_role(conn, entity_id, ROLE_PREVIEW_IMAGE_LARGE)?
+    {
+        return Ok(Some(preview));
+    }
+
+    if !is_video {
+        resolve_source_thumbnail_preview(conn, entity_id)
+    } else {
+        Ok(None)
+    }
+}
+
+fn is_video_entity(conn: &Connection, entity_id: Uuid) -> Result<bool, VaultError> {
+    if let Some(primary) = assets::find_primary_asset(conn, entity_id)? {
+        if primary.kind == "video" {
+            return Ok(true);
+        }
+        if primary
+            .mime
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("video/"))
+        {
+            return Ok(true);
+        }
+    }
+
+    let mime: Option<String> = conn
+        .query_row(
+            "SELECT mime FROM entity WHERE id = ?1",
+            [entity_id.to_string()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(db_err)?
+        .flatten();
+    Ok(mime
+        .as_deref()
+        .is_some_and(|mime| mime.starts_with("video/")))
+}
+
+pub fn resolve_timeline_sprite(
+    conn: &Connection,
+    entity_id: Uuid,
+) -> Result<Option<EntityPreview>, VaultError> {
+    preview_from_role(conn, entity_id, ROLE_TIMELINE_SPRITE)
+}
+
+pub fn resolve_timeline_manifest(
+    conn: &Connection,
+    entity_id: Uuid,
+) -> Result<Option<EntityPreview>, VaultError> {
+    preview_from_role(conn, entity_id, ROLE_TIMELINE_MANIFEST)
+}
+
+fn preview_from_role(
+    conn: &Connection,
+    entity_id: Uuid,
+    preview_role: &str,
+) -> Result<Option<EntityPreview>, VaultError> {
+    let Some(asset) = find_asset_by_preview_role(conn, entity_id, preview_role)? else {
+        return Ok(None);
+    };
+    Ok(Some(EntityPreview {
+        entity_id,
+        asset_id: asset.id,
+        kind: asset.kind,
+        preview_role: preview_role.to_string(),
+        status: asset.status,
+    }))
+}
+
+fn resolve_source_thumbnail_preview(
     conn: &Connection,
     entity_id: Uuid,
 ) -> Result<Option<EntityPreview>, VaultError> {
@@ -107,6 +219,17 @@ pub fn resolve_entity_preview(
         .map_err(db_err)?;
 
     let Some(external_id) = thumb_external_id else {
+        if let Some(primary) = assets::find_primary_asset(conn, entity_id)? {
+            if primary.kind == "image" && primary.status == "present" {
+                return Ok(Some(EntityPreview {
+                    entity_id,
+                    asset_id: primary.id,
+                    kind: primary.kind,
+                    preview_role: "primary_image".to_string(),
+                    status: primary.status,
+                }));
+            }
+        }
         return Ok(None);
     };
 
@@ -181,10 +304,14 @@ fn db_err(err: rusqlite::Error) -> VaultError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::import::db::{insert_entity, upsert_metadata};
     use crate::import::import;
     use crate::tags::add_tag;
     use archiveos_contract::ImportStrategy;
+    use crate::assets::UpsertAssetInput;
+    use crate::preview::ROLE_PREVIEW_IMAGE_SMALL;
     use crate::Vault;
+    use chrono::Utc;
     use tempfile::tempdir;
 
     #[test]
@@ -213,11 +340,165 @@ mod tests {
     }
 
     #[test]
+    fn resolve_preview_uses_generated_when_video_has_no_linked_thumbnail() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let entity_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        insert_entity(
+            vault.connection(),
+            entity_id,
+            None,
+            Some("video/mp4"),
+            0,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+        upsert_metadata(
+            vault.connection(),
+            entity_id,
+            "thumbnail_external_id",
+            "vid:thumbnail",
+            "archiveos",
+        )
+        .unwrap();
+
+        let generated_id = crate::assets::upsert_asset(
+            vault.connection(),
+            &UpsertAssetInput {
+                entity_id,
+                role: "supporting",
+                kind: "preview",
+                content_hash: Some("gen"),
+                mime: Some("image/webp"),
+                size: 1,
+                ext: Some(".webp"),
+                status: "present",
+                storage_strategy: "managed",
+                path: Some("/tmp/small.webp"),
+            },
+        )
+        .unwrap();
+        crate::assets::upsert_asset_metadata(
+            vault.connection(),
+            generated_id,
+            "preview_role",
+            ROLE_PREVIEW_IMAGE_SMALL,
+            "archiveos",
+        )
+        .unwrap();
+
+        let preview = resolve_entity_preview(vault.connection(), entity_id)
+            .unwrap()
+            .expect("preview");
+        assert_eq!(preview.preview_role, ROLE_PREVIEW_IMAGE_SMALL);
+        assert_eq!(preview.asset_id, generated_id);
+    }
+
+    #[test]
+    fn resolve_preview_prefers_source_thumbnail_for_video() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let video_id = Uuid::new_v4();
+        let thumb_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        insert_entity(
+            vault.connection(),
+            video_id,
+            None,
+            Some("video/mp4"),
+            0,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+        insert_entity(
+            vault.connection(),
+            thumb_id,
+            None,
+            Some("image/webp"),
+            1,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+        upsert_metadata(
+            vault.connection(),
+            video_id,
+            "thumbnail_external_id",
+            "vid:thumbnail",
+            "archiveos",
+        )
+        .unwrap();
+        crate::import::db::insert_source_ref(
+            vault.connection(),
+            Uuid::new_v4(),
+            thumb_id,
+            "youtube",
+            "thumbnail",
+            "vid:thumbnail",
+            None,
+            "live",
+        )
+        .unwrap();
+        let thumb_asset_id = crate::assets::upsert_asset(
+            vault.connection(),
+            &UpsertAssetInput {
+                entity_id: thumb_id,
+                role: "primary",
+                kind: "thumbnail",
+                content_hash: Some("thumb"),
+                mime: Some("image/webp"),
+                size: 1,
+                ext: Some(".webp"),
+                status: "present",
+                storage_strategy: "managed",
+                path: Some("/tmp/thumb.webp"),
+            },
+        )
+        .unwrap();
+        let generated_id = crate::assets::upsert_asset(
+            vault.connection(),
+            &UpsertAssetInput {
+                entity_id: video_id,
+                role: "supporting",
+                kind: "preview",
+                content_hash: Some("gen"),
+                mime: Some("image/webp"),
+                size: 1,
+                ext: Some(".webp"),
+                status: "present",
+                storage_strategy: "managed",
+                path: Some("/tmp/small.webp"),
+            },
+        )
+        .unwrap();
+        crate::assets::upsert_asset_metadata(
+            vault.connection(),
+            generated_id,
+            "preview_role",
+            ROLE_PREVIEW_IMAGE_SMALL,
+            "archiveos",
+        )
+        .unwrap();
+
+        let preview = resolve_entity_preview(vault.connection(), video_id)
+            .unwrap()
+            .expect("preview");
+        assert_eq!(preview.preview_role, "source_thumbnail");
+        assert_eq!(preview.asset_id, thumb_asset_id);
+    }
+
+    #[test]
     fn get_entity_metadata_entries_include_provenance() {
         let dir = tempdir().unwrap();
         let vault = Vault::init(dir.path().join("vault")).unwrap();
         let entity_id = Uuid::new_v4();
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = Utc::now().to_rfc3339();
         crate::import::db::insert_entity(
             vault.connection(),
             entity_id,
@@ -257,5 +538,27 @@ mod tests {
         let detail = get_entity(vault.connection(), entity_id).unwrap();
         assert_eq!(detail.metadata.get("title").map(String::as_str), Some("User Title"));
         assert_eq!(detail.metadata_entries.len(), 3);
+    }
+
+    #[test]
+    fn resolve_preview_handles_entity_with_null_mime() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let entity_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        insert_entity(
+            vault.connection(),
+            entity_id,
+            None,
+            None,
+            0,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+
+        let preview = resolve_entity_preview(vault.connection(), entity_id).unwrap();
+        assert!(preview.is_none());
     }
 }

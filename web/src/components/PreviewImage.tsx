@@ -1,9 +1,9 @@
 import { useState } from "react";
 import {
-  assetContentUrl,
   previewVisualState,
   type EntityPreviewSummary,
 } from "../api/client";
+import { useVault } from "../context/VaultContext";
 
 interface PreviewImageProps {
   preview?: EntityPreviewSummary | null;
@@ -16,6 +16,7 @@ export default function PreviewImage({
   title,
   compact = false,
 }: PreviewImageProps) {
+  const { assetContentUrl } = useVault();
   const [imageFailed, setImageFailed] = useState(false);
   const state = previewVisualState(preview, imageFailed);
 

@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { api, assetContentUrl, browserDisplayState, type EntityAsset } from "../api/client";
+import { browserDisplayState, type EntityAsset } from "../api/client";
+import { useVault } from "../context/VaultContext";
 
 interface AssetListProps {
   entityId: string;
@@ -8,6 +9,7 @@ interface AssetListProps {
 }
 
 export default function AssetList({ entityId, assets, onChanged }: AssetListProps) {
+  const { api, assetContentUrl } = useVault();
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,6 +35,7 @@ export default function AssetList({ entityId, assets, onChanged }: AssetListProp
           <tr>
             <th>Kind</th>
             <th>Status</th>
+            <th>Storage</th>
             <th>MIME</th>
             <th>Browser</th>
             <th>Action</th>
@@ -45,8 +48,10 @@ export default function AssetList({ entityId, assets, onChanged }: AssetListProp
               <tr key={asset.id}>
                 <td>
                   {asset.role}/{asset.kind}
+                  {asset.metadata.preview_role ? ` (${asset.metadata.preview_role})` : ""}
                 </td>
                 <td>{asset.status}</td>
+                <td>{asset.storage_strategy}</td>
                 <td>{asset.mime ?? "—"}</td>
                 <td>{display}</td>
                 <td>

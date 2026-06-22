@@ -58,6 +58,21 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vaults/{vault}/source-failures", get(list_source_failures).post(record_source_failure))
         .route("/vaults/{vault}/subscriptions", get(list_subscriptions).post(create_subscription))
         .route("/vaults/{vault}/subscriptions/{id}", delete(delete_subscription))
+        .route("/vaults/{vault}/capabilities", get(list_capabilities))
+        .route("/vaults/{vault}/collections", get(list_collections))
+        .route(
+            "/vaults/{vault}/collections/{collection_id}/members",
+            get(list_collection_members),
+        )
+        .route(
+            "/vaults/{vault}/entities/{id}/previews/regenerate",
+            post(regenerate_previews),
+        )
+        .route("/vaults/{vault}/previews/backfill", post(backfill_previews))
+        .route(
+            "/vaults/{vault}/jobs/{id}/preview-commit",
+            post(commit_preview_job),
+        )
 }
 
 async fn health() -> &'static str {
@@ -209,6 +224,8 @@ struct EntityDetailResponse {
     metadata_entries: Vec<archiveos_contract::MetadataEntry>,
     assets: Vec<EntityAssetResponse>,
     preview: Option<EntityPreviewResponse>,
+    timeline_sprite: Option<EntityPreviewResponse>,
+    timeline_manifest: Option<EntityPreviewResponse>,
 }
 
 #[derive(Serialize)]
@@ -247,6 +264,8 @@ impl From<archiveos_core::entity::EntityDetail> for EntityDetailResponse {
             metadata_entries: d.metadata_entries,
             assets: d.assets.into_iter().map(EntityAssetResponse::from).collect(),
             preview: d.preview.map(EntityPreviewResponse::from),
+            timeline_sprite: d.timeline_sprite.map(EntityPreviewResponse::from),
+            timeline_manifest: d.timeline_manifest.map(EntityPreviewResponse::from),
         }
     }
 }
@@ -629,6 +648,7 @@ async fn submit_manifest(
     let report = vault.import(&staging, Some(&body.manifest), ImportStrategy::Managed)?;
     let final_status = resolve_job_status(&body.manifest, body.status.as_deref());
     vault.finish_job(job_id, &final_status)?;
+    enqueue_preview_jobs_from_manifest(&vault, &vault_name, &body.manifest)?;
 
     Ok(Json(serde_json::json!({
         "job_id": job_id,
@@ -892,4 +912,164 @@ async fn delete_subscription(
     let vault = open_vault(&state, &vault_name)?;
     vault.delete_subscription(id)?;
     Ok(Json(serde_json::json!({ "removed": id })))
+}
+
+#[derive(Serialize)]
+struct VaultCapabilitiesResponse {
+    workers: Vec<archiveos_core::VaultCapability>,
+}
+
+async fn list_capabilities(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+) -> ApiResult<Json<VaultCapabilitiesResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(VaultCapabilitiesResponse {
+        workers: vault.vault_capabilities(),
+    }))
+}
+
+#[derive(Serialize)]
+struct CollectionSummaryResponse {
+    id: Uuid,
+    collection_type: String,
+    title: String,
+    member_count: i32,
+}
+
+impl From<archiveos_core::collections::CollectionSummary> for CollectionSummaryResponse {
+    fn from(value: archiveos_core::collections::CollectionSummary) -> Self {
+        Self {
+            id: value.id,
+            collection_type: value.collection_type,
+            title: value.title,
+            member_count: value.member_count,
+        }
+    }
+}
+
+async fn list_collections(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+) -> ApiResult<Json<Vec<CollectionSummaryResponse>>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(
+        vault
+            .list_collections()?
+            .into_iter()
+            .map(CollectionSummaryResponse::from)
+            .collect(),
+    ))
+}
+
+#[derive(Serialize)]
+struct CollectionMemberResponse {
+    id: Uuid,
+    title: Option<String>,
+    kind: Option<String>,
+    status: String,
+    position: i32,
+    preview: Option<EntityPreviewResponse>,
+}
+
+impl From<archiveos_core::collections::CollectionMemberItem> for CollectionMemberResponse {
+    fn from(value: archiveos_core::collections::CollectionMemberItem) -> Self {
+        Self {
+            id: value.id,
+            title: value.title,
+            kind: value.kind,
+            status: value.status,
+            position: value.position,
+            preview: value.preview.map(|preview| EntityPreviewResponse {
+                entity_id: preview.entity_id,
+                asset_id: preview.asset_id,
+                kind: preview.kind,
+                preview_role: preview.preview_role,
+                status: preview.status,
+            }),
+        }
+    }
+}
+
+async fn list_collection_members(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, collection_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<Vec<CollectionMemberResponse>>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(
+        vault
+            .list_collection_members(collection_id)?
+            .into_iter()
+            .map(CollectionMemberResponse::from)
+            .collect(),
+    ))
+}
+
+async fn regenerate_previews(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let _ = vault.get_entity(entity_id)?;
+    let job = vault.regenerate_preview_job(&vault_name, entity_id)?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+async fn backfill_previews(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+) -> ApiResult<Json<archiveos_core::preview::PreviewBackfillReport>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(vault.backfill_preview_jobs(&vault_name)?))
+}
+
+#[derive(Deserialize)]
+struct CommitPreviewJobRequest {
+    entity_id: Uuid,
+    files: Vec<archiveos_core::preview::PreviewFileCommit>,
+}
+
+async fn commit_preview_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+    Json(body): Json<CommitPreviewJobRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    if vault.get_job(job_id)?.is_none() {
+        return Err(archiveos_contract::VaultError::NotFound.into());
+    }
+    vault.commit_preview_files(job_id, body.entity_id, &body.files)?;
+    vault.finish_job(job_id, "done")?;
+    Ok(Json(serde_json::json!({
+        "job_id": job_id,
+        "entity_id": body.entity_id,
+        "files": body.files.len(),
+        "status": "done",
+    })))
+}
+
+fn enqueue_preview_jobs_from_manifest(
+    vault: &Vault,
+    vault_name: &str,
+    manifest: &ImportManifest,
+) -> Result<(), archiveos_contract::VaultError> {
+    for item in &manifest.items {
+        if item.status != "complete" {
+            continue;
+        }
+        let Some(source_ref) = &item.source_ref else {
+            continue;
+        };
+        let Some(entity_id) = archiveos_core::import::db::find_entity_by_source_ref(
+            vault.connection(),
+            &source_ref.source,
+            &source_ref.kind,
+            &source_ref.external_id,
+        )?
+        else {
+            continue;
+        };
+        let _ = vault.maybe_enqueue_preview_job(vault_name, entity_id)?;
+    }
+    Ok(())
 }

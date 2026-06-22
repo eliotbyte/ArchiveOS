@@ -2,6 +2,7 @@ mod asset_reconcile_scheduler;
 mod error;
 mod inbox_watcher;
 mod media;
+mod preview_backfill;
 mod routes;
 mod subscription_scheduler;
 
@@ -65,6 +66,13 @@ async fn main() {
             .expect("ARCHIVEOS_DEFAULT_VAULT required when asset reconcile scheduler enabled");
         asset_reconcile_scheduler::spawn(config_dir.clone(), vault_name);
         tracing::info!("asset reconcile scheduler started");
+    }
+
+    if preview_backfill::enabled() {
+        let vault_name = std::env::var("ARCHIVEOS_DEFAULT_VAULT")
+            .expect("ARCHIVEOS_DEFAULT_VAULT required when preview backfill on start enabled");
+        preview_backfill::spawn(config_dir.clone(), vault_name);
+        tracing::info!("preview backfill on start queued");
     }
 
     let state = Arc::new(AppState { config_dir });

@@ -29,6 +29,10 @@ pub struct EntityListItem {
     pub source: Option<String>,
     pub tags: Vec<String>,
     pub preview: Option<EntityPreviewSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline_sprite: Option<EntityPreviewSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeline_manifest: Option<EntityPreviewSummary>,
     pub primary_asset_id: Option<Uuid>,
     pub primary_asset_status: Option<String>,
 }

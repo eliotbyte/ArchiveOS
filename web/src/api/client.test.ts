@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   browserDisplayState,
+  kindIcon,
+  mediaKindFromEntity,
   previewVisualState,
   type EntityPreviewSummary,
 } from "./client";
@@ -38,5 +40,19 @@ describe("previewVisualState", () => {
 
   it("returns failed when image load fails", () => {
     expect(previewVisualState(preview, true)).toBe("failed");
+  });
+});
+
+describe("kindIcon", () => {
+  it("returns icons per kind", () => {
+    expect(kindIcon("video")).toBe("▶");
+    expect(kindIcon("image")).toBe("◻");
+  });
+});
+
+describe("mediaKindFromEntity", () => {
+  it("infers image from mime when kind is file", () => {
+    expect(mediaKindFromEntity("file", "image/jpeg")).toBe("image");
+    expect(mediaKindFromEntity(null, "video/mp4")).toBe("video");
   });
 });

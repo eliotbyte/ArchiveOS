@@ -371,6 +371,58 @@ pub fn mark_entity_assets_deleted(conn: &Connection, entity_id: Uuid) -> Result<
     Ok(())
 }
 
+pub fn find_primary_asset(
+    conn: &Connection,
+    entity_id: Uuid,
+) -> Result<Option<EntityAsset>, VaultError> {
+    conn.query_row(
+        "SELECT id, entity_id, role, kind, content_hash, mime, size, ext, status,
+                storage_strategy, path, created_at, updated_at, deleted_at
+         FROM entity_asset
+         WHERE entity_id = ?1 AND role = 'primary'
+         ORDER BY created_at ASC
+         LIMIT 1",
+        [entity_id.to_string()],
+        map_asset,
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+pub fn find_asset_by_preview_role(
+    conn: &Connection,
+    entity_id: Uuid,
+    preview_role: &str,
+) -> Result<Option<EntityAsset>, VaultError> {
+    conn.query_row(
+        "SELECT ea.id, ea.entity_id, ea.role, ea.kind, ea.content_hash, ea.mime, ea.size, ea.ext,
+                ea.status, ea.storage_strategy, ea.path, ea.created_at, ea.updated_at, ea.deleted_at
+         FROM entity_asset ea
+         JOIN entity_asset_metadata eam ON eam.asset_id = ea.id
+         WHERE ea.entity_id = ?1 AND eam.key = 'preview_role' AND eam.value = ?2
+         ORDER BY ea.updated_at DESC
+         LIMIT 1",
+        params![entity_id.to_string(), preview_role],
+        map_asset,
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+pub fn upsert_preview_asset(
+    conn: &Connection,
+    entity_id: Uuid,
+    preview_role: &str,
+    _kind: &str,
+    input: &UpsertAssetInput<'_>,
+) -> Result<Uuid, VaultError> {
+    if let Some(existing) = find_asset_by_preview_role(conn, entity_id, preview_role)? {
+        update_asset_present(conn, existing.id, input)?;
+        return Ok(existing.id);
+    }
+    upsert_asset(conn, input)
+}
+
 fn find_asset_by_entity_kind_hash(
     conn: &Connection,
     entity_id: Uuid,

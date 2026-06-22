@@ -22,6 +22,13 @@ pub struct Vault {
     db: Connection,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VaultCapability {
+    pub id: String,
+    pub label: String,
+    pub enabled: bool,
+}
+
 impl Vault {
     pub fn init(root: impl AsRef<Path>) -> Result<Self, VaultError> {
         let root = root.as_ref().to_path_buf();
@@ -169,8 +176,72 @@ impl Vault {
         crate::import::import(self, staging_dir, manifest, strategy)
     }
 
-    pub fn process_inbox(&self) -> Result<crate::inbox::InboxReport, VaultError> {
-        crate::inbox::process_inbox(self)
+    pub fn process_inbox(&self, target_vault: Option<&str>) -> Result<crate::inbox::InboxReport, VaultError> {
+        crate::inbox::process_inbox(self, target_vault)
+    }
+
+    pub fn maybe_enqueue_preview_job(
+        &self,
+        target_vault: &str,
+        entity_id: Uuid,
+    ) -> Result<Option<crate::jobs::Job>, VaultError> {
+        crate::preview::maybe_enqueue_preview_job(self.connection(), target_vault, entity_id)
+    }
+
+    pub fn backfill_preview_jobs(
+        &self,
+        target_vault: &str,
+    ) -> Result<crate::preview::PreviewBackfillReport, VaultError> {
+        crate::preview::backfill_preview_jobs(self.connection(), target_vault)
+    }
+
+    pub fn regenerate_preview_job(
+        &self,
+        target_vault: &str,
+        entity_id: Uuid,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        let input = serde_json::json!({ "entity_id": entity_id });
+        crate::jobs::create_job(
+            self.connection(),
+            crate::preview::JOB_TYPE_PREVIEW,
+            target_vault,
+            &input.to_string(),
+        )
+    }
+
+    pub fn commit_preview_files(
+        &self,
+        job_id: Uuid,
+        entity_id: Uuid,
+        files: &[crate::preview::PreviewFileCommit],
+    ) -> Result<(), VaultError> {
+        crate::preview::commit_preview_files(self, job_id, entity_id, files)
+    }
+
+    pub fn list_collections(&self) -> Result<Vec<crate::collections::CollectionSummary>, VaultError> {
+        crate::collections::list_collections(self.connection())
+    }
+
+    pub fn list_collection_members(
+        &self,
+        collection_id: Uuid,
+    ) -> Result<Vec<crate::collections::CollectionMemberItem>, VaultError> {
+        crate::collections::list_collection_members(self.connection(), collection_id)
+    }
+
+    pub fn vault_capabilities(&self) -> Vec<VaultCapability> {
+        vec![
+            VaultCapability {
+                id: "ytdlp".into(),
+                label: "yt-dlp".into(),
+                enabled: self.ytdlp_worker_dir().exists(),
+            },
+            VaultCapability {
+                id: "thumbnail".into(),
+                label: "Preview generator".into(),
+                enabled: self.thumbnail_worker_dir().exists(),
+            },
+        ]
     }
 
     pub fn add_tag(&self, entity_id: Uuid, tag: &str) -> Result<(), VaultError> {
@@ -687,7 +758,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let vault = Vault::init(dir.path()).unwrap();
         std::fs::write(vault.inbox_dir().join("video.mp4"), b"video").unwrap();
-        vault.process_inbox().unwrap();
+        vault.process_inbox(None).unwrap();
 
         let entity_id: Uuid = vault
             .connection()
@@ -779,7 +850,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let vault = Vault::init(dir.path()).unwrap();
         std::fs::write(vault.inbox_dir().join("video.mp4"), b"video").unwrap();
-        vault.process_inbox().unwrap();
+        vault.process_inbox(None).unwrap();
 
         let (entity_id, asset_id): (Uuid, Uuid) = vault
             .connection()
@@ -812,7 +883,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let vault = Vault::init(dir.path()).unwrap();
         std::fs::write(vault.inbox_dir().join("video.mp4"), b"video").unwrap();
-        vault.process_inbox().unwrap();
+        vault.process_inbox(None).unwrap();
 
         let asset_path: String = vault
             .connection()
