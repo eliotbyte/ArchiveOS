@@ -252,26 +252,36 @@ pub fn insert_source_ref(
     Ok(())
 }
 
+pub fn canonical_platform_source(source: &str) -> &str {
+    if source.starts_with("youtube") {
+        "youtube"
+    } else {
+        source
+    }
+}
+
 pub fn upsert_source_ref(
     conn: &Connection,
     entity_id: Uuid,
     source_ref: &ManifestSourceRef,
 ) -> Result<(), VaultError> {
-    if let Some(existing_id) = find_entity_by_source_ref(
-        conn,
-        &source_ref.source,
-        &source_ref.kind,
-        &source_ref.external_id,
-    )? {
+    let source = canonical_platform_source(&source_ref.source);
+    let kind = source_ref.kind.as_str();
+    let external_id = source_ref.external_id.as_str();
+
+    conn.execute(
+        "DELETE FROM source_ref
+         WHERE source LIKE 'youtube%' AND source != 'youtube'
+           AND kind = ?1 AND external_id = ?2",
+        params![kind, external_id],
+    )
+    .map_err(db_err)?;
+
+    if let Some(existing_id) = find_entity_by_source_ref(conn, source, kind, external_id)? {
         conn.execute(
             "UPDATE source_ref SET url = ?1, status = 'live'
              WHERE source = ?2 AND kind = ?3 AND external_id = ?4",
-            params![
-                source_ref.url.as_deref(),
-                source_ref.source,
-                source_ref.kind,
-                source_ref.external_id,
-            ],
+            params![source_ref.url.as_deref(), source, kind, external_id],
         )
         .map_err(db_err)?;
         if existing_id != entity_id {
@@ -281,9 +291,9 @@ pub fn upsert_source_ref(
                 params![
                     entity_id.to_string(),
                     source_ref.url.as_deref(),
-                    source_ref.source,
-                    source_ref.kind,
-                    source_ref.external_id,
+                    source,
+                    kind,
+                    external_id,
                 ],
             )
             .map_err(db_err)?;
@@ -294,9 +304,9 @@ pub fn upsert_source_ref(
             conn,
             Uuid::new_v4(),
             entity_id,
-            &source_ref.source,
-            &source_ref.kind,
-            &source_ref.external_id,
+            source,
+            kind,
+            external_id,
             source_ref.url.as_deref(),
             "live",
         )?;
@@ -318,6 +328,72 @@ pub fn update_source_ref_status(
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+pub fn primary_source_url(conn: &Connection, entity_id: Uuid) -> Result<Option<String>, VaultError> {
+    conn.query_row(
+        "SELECT url FROM source_ref
+         WHERE entity_id = ?1 AND url IS NOT NULL AND url != ''
+         ORDER BY CASE kind
+           WHEN 'video' THEN 0
+           WHEN 'playlist' THEN 1
+           WHEN 'channel' THEN 2
+           ELSE 3 END
+         LIMIT 1",
+        [entity_id.to_string()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+pub fn source_ref_urls_for_entity(
+    conn: &Connection,
+    entity_id: Uuid,
+) -> Result<Vec<String>, VaultError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT url FROM source_ref
+             WHERE entity_id = ?1 AND url IS NOT NULL AND url != ''",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([entity_id.to_string()], |row| row.get::<_, String>(0))
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+pub fn source_url_target_user_deleted(conn: &Connection, url: &str) -> Result<bool, VaultError> {
+    let Some(entity_id) = find_entity_id_by_source_url(conn, url)? else {
+        return Ok(false);
+    };
+    let status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM entity WHERE id = ?1",
+            [entity_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    Ok(status.as_deref() == Some("user_deleted"))
+}
+
+pub fn find_entity_id_by_source_url(conn: &Connection, url: &str) -> Result<Option<Uuid>, VaultError> {
+    conn.query_row(
+        "SELECT entity_id FROM source_ref
+         WHERE url = ?1
+         ORDER BY CASE kind
+           WHEN 'playlist' THEN 0
+           WHEN 'channel' THEN 1
+           ELSE 2 END
+         LIMIT 1",
+        [url],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map_err(db_err)?
+    .map(|id| Uuid::parse_str(&id).map_err(|e| VaultError::InvalidLayout { detail: e.to_string() }))
+    .transpose()
 }
 
 pub fn upsert_metadata(

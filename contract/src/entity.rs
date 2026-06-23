@@ -20,6 +20,18 @@ pub struct EntityPreviewSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDetail {
+    pub id: Uuid,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub follower_count: Option<String>,
+    pub verified: Option<bool>,
+    pub source: Option<String>,
+    pub url: Option<String>,
+    pub avatar_preview: Option<EntityPreviewSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityListItem {
     pub id: Uuid,
     pub title: Option<String>,
@@ -37,6 +49,10 @@ pub struct EntityListItem {
     pub primary_asset_status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_entity_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_avatar_preview: Option<EntityPreviewSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uploader: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -62,9 +78,12 @@ pub struct BrowseQuery {
     pub text: Option<String>,
     pub kind: Option<String>,
     pub source: Option<String>,
+    pub exclude_source: Option<String>,
     pub status: Option<String>,
     pub limit: u32,
     pub include_hidden: bool,
+    pub sort: Option<String>,
+    pub uploaded_by: Option<Uuid>,
 }
 
 impl SearchQuery {

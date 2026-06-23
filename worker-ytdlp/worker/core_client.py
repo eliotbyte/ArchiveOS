@@ -5,6 +5,10 @@ from typing import Any
 import requests
 
 
+class JobCancelled(Exception):
+    """Raised when the core marks a running job as cancelled."""
+
+
 class CoreClient:
     def __init__(self, core_url: str, vault_name: str) -> None:
         self.core_url = core_url.rstrip("/")
@@ -20,13 +24,24 @@ class CoreClient:
         response.raise_for_status()
         return response.json()
 
-    def heartbeat(self, job_id: str, lease_secs: int) -> None:
+    def heartbeat(
+        self,
+        job_id: str,
+        lease_secs: int,
+        *,
+        progress: dict[str, Any] | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {"lease_secs": lease_secs}
+        if progress is not None:
+            payload["progress"] = progress
         response = self.session.post(
             f"{self.core_url}/vaults/{self.vault_name}/jobs/{job_id}/heartbeat",
-            json={"lease_secs": lease_secs},
+            json=payload,
             timeout=30,
         )
         response.raise_for_status()
+        data = response.json()
+        return bool(data.get("cancelled"))
 
     def source_states(
         self,

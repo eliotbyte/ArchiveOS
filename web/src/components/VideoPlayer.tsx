@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
+import { useCallback, useEffect, useRef, useState, type CSSProperties, type PointerEvent } from "react";
 import { createPortal } from "react-dom";
+import { ApiError } from "../api/client";
 import { useVault } from "../context/VaultContext";
 import { useVideoPlayer } from "../context/VideoPlayerContext";
 import { formatDurationLabel } from "../player/queue";
@@ -41,7 +42,7 @@ function releasePointer(target: HTMLElement, pointerId: number) {
 }
 
 export default function VideoPlayer() {
-  const { assetContentUrl } = useVault();
+  const { assetContentUrl, api } = useVault();
   const {
     mode,
     currentItem,
@@ -89,6 +90,8 @@ export default function VideoPlayer() {
   const [centerFlash, setCenterFlash] = useState<"play" | "pause" | null>(null);
   const [miniDragging, setMiniDragging] = useState(false);
   const [mediaAspectRatio, setMediaAspectRatio] = useState(16 / 9);
+  const serverLoadedEntitiesRef = useRef<Set<string>>(new Set());
+  const lastServerSyncRef = useRef(0);
 
   const variant = mode === "mini" ? "mini" : "full";
   const mediaSrc = currentItem
@@ -108,6 +111,52 @@ export default function VideoPlayer() {
     setIdleHidden(false);
     setMediaAspectRatio(16 / 9);
   }, [currentItem?.primaryAssetId, getPlaybackPosition]);
+
+  useEffect(() => {
+    if (!currentItem) return;
+    if (serverLoadedEntitiesRef.current.has(currentItem.entityId)) return;
+    serverLoadedEntitiesRef.current.add(currentItem.entityId);
+    void api
+      .getPlaybackState(currentItem.entityId)
+      .then((state) => {
+        if (state.position_seconds <= 0) return;
+        savePlaybackPosition(
+          currentItem.primaryAssetId,
+          state.position_seconds,
+        );
+        const video = videoRef.current;
+        if (
+          video &&
+          video.readyState >= HTMLMediaElement.HAVE_METADATA &&
+          video.duration > 0 &&
+          state.position_seconds < video.duration - 0.25
+        ) {
+          video.currentTime = state.position_seconds;
+          setCurrentTime(state.position_seconds);
+        }
+      })
+      .catch((err) => {
+        if (err instanceof ApiError && err.status === 404) return;
+      });
+  }, [api, currentItem, savePlaybackPosition]);
+
+  const syncPlaybackToServer = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || !currentItem) return;
+    const now = Date.now();
+    if (now - lastServerSyncRef.current < 4000) return;
+    lastServerSyncRef.current = now;
+    void api
+      .upsertPlaybackState(currentItem.entityId, {
+        asset_id: currentItem.primaryAssetId,
+        position_seconds: video.currentTime,
+        duration_seconds:
+          Number.isFinite(video.duration) && video.duration > 0
+            ? video.duration
+            : undefined,
+      })
+      .catch(() => {});
+  }, [api, currentItem]);
 
   function restorePlaybackPosition() {
     const video = videoRef.current;
@@ -171,9 +220,31 @@ export default function VideoPlayer() {
       const video = videoRef.current;
       if (video && currentItem) {
         savePlaybackPosition(currentItem.primaryAssetId, video.currentTime);
+        void api
+          .upsertPlaybackState(currentItem.entityId, {
+            asset_id: currentItem.primaryAssetId,
+            position_seconds: video.currentTime,
+            duration_seconds:
+              Number.isFinite(video.duration) && video.duration > 0
+                ? video.duration
+                : undefined,
+          })
+          .catch(() => {});
       }
     };
-  }, [currentItem?.primaryAssetId, portalReady, mode, savePlaybackPosition]);
+  }, [api, currentItem?.entityId, currentItem?.primaryAssetId, portalReady, mode, savePlaybackPosition]);
+
+  useEffect(() => {
+    if (!playing || !currentItem) return;
+    const interval = window.setInterval(syncPlaybackToServer, 8000);
+    return () => window.clearInterval(interval);
+  }, [playing, currentItem, syncPlaybackToServer]);
+
+  useEffect(() => {
+    if (!playing) {
+      syncPlaybackToServer();
+    }
+  }, [playing, syncPlaybackToServer]);
 
   useEffect(() => {
     const video = videoRef.current;

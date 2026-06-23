@@ -12,6 +12,10 @@ import VideoPlayer from "./VideoPlayer";
 vi.mock("../context/VaultContext", () => ({
   useVault: () => ({
     assetContentUrl: (assetId: string) => `/assets/${assetId}`,
+    api: {
+      getPlaybackState: vi.fn().mockRejectedValue({ status: 404 }),
+      upsertPlaybackState: vi.fn().mockResolvedValue({}),
+    },
   }),
 }));
 

@@ -6,10 +6,11 @@ import EntityPage from "./pages/EntityPage";
 import IntegrationsPage from "./pages/IntegrationsPage";
 import JobsPage from "./pages/JobsPage";
 import LibraryHomePage from "./pages/LibraryHomePage";
+import LibraryListPage from "./pages/LibraryListPage";
 import PlaylistsPage from "./pages/PlaylistsPage";
 import SectionBrowserPage from "./pages/SectionBrowserPage";
-import YouTubePlaylistPage from "./pages/YouTubePlaylistPage";
 import YouTubeSectionPage from "./pages/YouTubeSectionPage";
+import YouTubeChannelPage from "./pages/YouTubeChannelPage";
 import YtdlpPage from "./pages/YtdlpPage";
 
 function GlobalVideoPlayer() {
@@ -42,8 +43,16 @@ export default function App() {
           <Route path="/" element={<LibraryHomePage />} />
           <Route path="/library/youtube" element={<YouTubeSectionPage />} />
           <Route
+            path="/library/youtube/channels/:channelId"
+            element={<YouTubeChannelPage />}
+          />
+          <Route
+            path="/library/youtube/lists/:listId"
+            element={<LibraryListPage />}
+          />
+          <Route
             path="/library/youtube/playlists/:collectionId"
-            element={<YouTubePlaylistPage />}
+            element={<LibraryListPage />}
           />
           <Route path="/library/:sectionId" element={<SectionBrowserPage />} />
           <Route path="/entities/:id" element={<EntityPage />} />

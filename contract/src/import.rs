@@ -94,6 +94,13 @@ fn default_membership_kind() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestChannelAvatar {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestChannel {
     pub source: String,
     pub kind: String,
@@ -104,6 +111,8 @@ pub struct ManifestChannel {
     pub metadata: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata_by_provenance: BTreeMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar: Option<ManifestChannelAvatar>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

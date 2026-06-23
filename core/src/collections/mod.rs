@@ -1,9 +1,12 @@
+use std::path::Path;
+
 use archiveos_contract::{EntityPreviewSummary, VaultError};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::entity::{
-    resolve_entity_preview, resolve_timeline_manifest, resolve_timeline_sprite,
+    resolve_entity_preview, resolve_entity_preview_at, resolve_timeline_manifest,
+    resolve_timeline_sprite,
 };
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -47,6 +50,10 @@ pub struct CollectionMemberItem {
     pub primary_asset_status: Option<String>,
     pub duration: Option<String>,
     pub channel: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_entity_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_avatar_preview: Option<EntityPreviewSummary>,
     pub uploader: Option<String>,
     pub webpage_url: Option<String>,
 }
@@ -116,6 +123,7 @@ pub fn list_collections(
 
 pub fn get_collection(
     conn: &Connection,
+    vault_root: Option<&Path>,
     collection_id: Uuid,
 ) -> Result<CollectionDetail, VaultError> {
     let row: Option<(String, String, i32)> = conn
@@ -137,7 +145,7 @@ pub fn get_collection(
         return Err(VaultError::NotFound);
     };
 
-    let members = list_collection_members(conn, collection_id)?;
+    let members = list_collection_members(conn, vault_root, collection_id)?;
     let cover_preview = if member_count > 0 {
         members
             .first()
@@ -159,6 +167,7 @@ pub fn get_collection(
 
 pub fn list_collection_members(
     conn: &Connection,
+    vault_root: Option<&Path>,
     collection_id: Uuid,
 ) -> Result<Vec<CollectionMemberItem>, VaultError> {
     let title_order = crate::metadata::title_precedence_sql();
@@ -247,7 +256,8 @@ pub fn list_collection_members(
             source,
             status,
             position,
-            preview: resolve_entity_preview(conn, entity_id)?.map(EntityPreviewSummary::from),
+            preview: resolve_entity_preview_at(conn, entity_id, vault_root)?
+                .map(EntityPreviewSummary::from),
             timeline_sprite: resolve_timeline_sprite(conn, entity_id)?
                 .map(EntityPreviewSummary::from),
             timeline_manifest: resolve_timeline_manifest(conn, entity_id)?
@@ -256,12 +266,37 @@ pub fn list_collection_members(
             primary_asset_status,
             duration: metadata_value(conn, entity_id, "duration")?,
             channel: metadata_value(conn, entity_id, "channel")?,
+            channel_entity_id: None,
+            channel_avatar_preview: None,
             uploader: metadata_value(conn, entity_id, "uploader")?,
             webpage_url: metadata_value(conn, entity_id, "webpage_url")?,
         });
     }
 
+    enrich_collection_members(conn, &mut items)?;
+
     Ok(items)
+}
+
+fn enrich_collection_members(
+    conn: &Connection,
+    items: &mut [CollectionMemberItem],
+) -> Result<(), VaultError> {
+    let ids: Vec<Uuid> = items.iter().map(|item| item.id).collect();
+    let channels = crate::channels::batch_resolve_uploaded_by_channels(conn, &ids)?;
+    for item in items {
+        if let Some(channel) = channels.get(&item.id) {
+            item.channel_entity_id = Some(channel.channel_entity_id);
+            item.channel_avatar_preview = channel
+                .avatar_preview
+                .clone()
+                .map(EntityPreviewSummary::from);
+            if item.channel.is_none() {
+                item.channel = channel.title.clone();
+            }
+        }
+    }
+    Ok(())
 }
 
 fn resolve_collection_cover(
@@ -374,7 +409,7 @@ mod tests {
     #[test]
     fn get_collection_returns_detail_with_members() {
         let (vault, collection_id) = setup_collection_with_members(3);
-        let detail = get_collection(vault.connection(), collection_id).unwrap();
+        let detail = get_collection(vault.connection(), None, collection_id).unwrap();
         assert_eq!(detail.collection_type, "youtube_playlist");
         assert_eq!(detail.title, "Test Playlist");
         assert_eq!(detail.member_count, 3);
@@ -385,7 +420,7 @@ mod tests {
     #[test]
     fn get_collection_missing_returns_not_found() {
         let vault = temp_vault();
-        let err = get_collection(vault.connection(), Uuid::new_v4()).unwrap_err();
+        let err = get_collection(vault.connection(), None, Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, VaultError::NotFound));
     }
 }

@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
-use archiveos_contract::{AssetPolicy, BrowseQuery, ImportManifest, ImportStrategy, SearchQuery, SubscriptionOptions, VaultRegistryEntry, YtdlpJobInput};
+use archiveos_contract::{
+    AddUserListMemberInput, AssetPolicy, BrowseQuery, CreateUserListInput, ImportManifest,
+    ImportStrategy, LibraryListQuery, PlaybackStateInput, ReorderUserListMembersInput, SearchQuery,
+    SubscriptionOptions, UserMediaPreferences, VaultRegistryEntry, YtdlpJobInput,
+};
 use archiveos_core::{open_vault_ref, Vault};
 use axum::extract::{Path, Query, State};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -17,6 +21,11 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vaults", get(list_vaults).post(register_vault))
         .route("/vaults/{name}", delete(unregister_vault))
         .route("/vaults/{vault}/entities", get(list_entities))
+        .route("/vaults/{vault}/channels/{channel_id}", get(get_channel))
+        .route(
+            "/vaults/{vault}/channels/{channel_id}/videos",
+            get(list_channel_videos),
+        )
         .route("/vaults/{vault}/entities/{id}", get(get_entity).delete(delete_entity))
         .route(
             "/vaults/{vault}/entities/{id}/assets/{asset_id}",
@@ -35,6 +44,7 @@ pub fn router() -> Router<Arc<AppState>> {
             get(crate::media::asset_content),
         )
         .route("/vaults/{vault}/reconcile/assets", post(reconcile_assets))
+        .route("/vaults/{vault}/reconcile/blobs", post(reconcile_blobs))
         .route(
             "/vaults/{vault}/collections/{collection_id}/members/{entity_id}",
             delete(remove_collection_member),
@@ -48,6 +58,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vaults/{vault}/jobs", get(list_jobs).post(create_job))
         .route("/vaults/{vault}/jobs/{id}", get(get_job))
         .route("/vaults/{vault}/jobs/{id}/retry", post(retry_job))
+        .route("/vaults/{vault}/jobs/{id}/cancel", post(cancel_job))
         .route("/vaults/{vault}/archive", post(create_archive))
         .route("/vaults/{vault}/subscribe", post(subscribe_archive))
         .route("/vaults/{vault}/jobs/claim", post(claim_job))
@@ -58,12 +69,48 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vaults/{vault}/source-failures", get(list_source_failures).post(record_source_failure))
         .route("/vaults/{vault}/subscriptions", get(list_subscriptions).post(create_subscription))
         .route("/vaults/{vault}/subscriptions/{id}", delete(delete_subscription))
+        .route("/vaults/{vault}/subscriptions/{id}/run", post(run_subscription))
+        .route(
+            "/vaults/{vault}/users/me/media-preferences",
+            get(get_media_preferences).put(set_media_preferences),
+        )
+        .route(
+            "/vaults/{vault}/entities/{id}/refresh-from-source",
+            post(refresh_entity_from_source),
+        )
+        .route(
+            "/vaults/{vault}/collections/{collection_id}/refresh-from-source",
+            post(refresh_collection_from_source),
+        )
         .route("/vaults/{vault}/capabilities", get(list_capabilities))
         .route("/vaults/{vault}/collections", get(list_collections))
         .route("/vaults/{vault}/collections/{collection_id}", get(get_collection))
         .route(
             "/vaults/{vault}/collections/{collection_id}/members",
             get(list_collection_members),
+        )
+        .route("/vaults/{vault}/library/lists", get(list_library_lists))
+        .route("/vaults/{vault}/library/lists/{list_id}", get(get_library_list))
+        .route(
+            "/vaults/{vault}/playback-state/{entity_id}",
+            get(get_playback_state).put(upsert_playback_state),
+        )
+        .route(
+            "/vaults/{vault}/playback-state/{entity_id}/dismiss",
+            post(dismiss_playback_state),
+        )
+        .route("/vaults/{vault}/user-lists", post(create_user_list))
+        .route(
+            "/vaults/{vault}/user-lists/{list_id}/members",
+            post(add_user_list_member),
+        )
+        .route(
+            "/vaults/{vault}/user-lists/{list_id}/members/reorder",
+            patch(reorder_user_list_members),
+        )
+        .route(
+            "/vaults/{vault}/user-lists/{list_id}/members/{entity_id}",
+            delete(remove_user_list_member),
         )
         .route(
             "/vaults/{vault}/entities/{id}/previews/regenerate",
@@ -195,6 +242,35 @@ async fn reconcile_assets(
     Ok(Json(serde_json::json!({ "missing_local": changed })))
 }
 
+#[derive(Deserialize)]
+struct ReconcileBlobsParams {
+    #[serde(default = "default_blob_gc_dry_run")]
+    dry_run: bool,
+    min_age_secs: Option<u64>,
+}
+
+fn default_blob_gc_dry_run() -> bool {
+    true
+}
+
+async fn reconcile_blobs(
+    State(state): State<Arc<AppState>>,
+    Path(vault): Path<String>,
+    Query(params): Query<ReconcileBlobsParams>,
+) -> ApiResult<Json<archiveos_contract::BlobGcReport>> {
+    let vault = open_vault(&state, &vault)?;
+    let min_age_secs = params.min_age_secs.unwrap_or_else(default_blob_gc_min_age_secs);
+    let report = vault.reconcile_blobs(params.dry_run, min_age_secs)?;
+    Ok(Json(report))
+}
+
+fn default_blob_gc_min_age_secs() -> u64 {
+    std::env::var("ARCHIVEOS_BLOB_GC_MIN_AGE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(86_400)
+}
+
 async fn remove_collection_member(
     State(state): State<Arc<AppState>>,
     Path((vault, collection_id, entity_id)): Path<(String, Uuid, Uuid)>,
@@ -318,11 +394,14 @@ struct BrowseParams {
     query: Option<String>,
     kind: Option<String>,
     source: Option<String>,
+    exclude_source: Option<String>,
     status: Option<String>,
     #[serde(default = "default_browse_limit")]
     limit: u32,
     #[serde(default)]
     include_hidden: bool,
+    sort: Option<String>,
+    uploaded_by: Option<Uuid>,
 }
 
 fn default_browse_limit() -> u32 {
@@ -339,10 +418,38 @@ async fn list_entities(
         text: params.query,
         kind: params.kind,
         source: params.source,
+        exclude_source: params.exclude_source,
         status: params.status,
         limit: params.limit,
         include_hidden: params.include_hidden,
+        sort: params.sort,
+        uploaded_by: params.uploaded_by,
     })?;
+    Ok(Json(items))
+}
+
+async fn get_channel(
+    State(state): State<Arc<AppState>>,
+    Path((vault, channel_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<archiveos_contract::ChannelDetail>> {
+    let vault = open_vault(&state, &vault)?;
+    Ok(Json(vault.get_channel(channel_id)?))
+}
+
+#[derive(Deserialize)]
+struct ChannelVideosParams {
+    #[serde(default = "default_browse_limit")]
+    limit: u32,
+    sort: Option<String>,
+}
+
+async fn list_channel_videos(
+    State(state): State<Arc<AppState>>,
+    Path((vault, channel_id)): Path<(String, Uuid)>,
+    Query(params): Query<ChannelVideosParams>,
+) -> ApiResult<Json<Vec<archiveos_contract::EntityListItem>>> {
+    let vault = open_vault(&state, &vault)?;
+    let items = vault.list_channel_videos(channel_id, params.limit, params.sort.as_deref())?;
     Ok(Json(items))
 }
 
@@ -483,6 +590,7 @@ async fn subscribe_archive(
             resync: body.resync,
             removed_items: body.removed_items,
             asset_policy: body.asset_policy,
+            ..Default::default()
         }),
     })?;
     Ok(Json(SubscriptionResponse::from(sub)))
@@ -493,6 +601,8 @@ struct ListJobsParams {
     status: Option<String>,
     #[serde(rename = "type")]
     job_type: Option<String>,
+    #[serde(default)]
+    root_only: bool,
     #[serde(default = "default_job_limit")]
     limit: i32,
 }
@@ -510,18 +620,46 @@ async fn list_jobs(
     let jobs = vault.list_jobs(archiveos_core::jobs::JobListFilter {
         status: params.status.as_deref(),
         job_type: params.job_type.as_deref(),
+        root_only: params.root_only,
         limit: params.limit,
     })?;
     Ok(Json(jobs.into_iter().map(JobResponse::from).collect()))
 }
 
+#[derive(Deserialize)]
+struct GetJobParams {
+    #[serde(default)]
+    include_children: bool,
+}
+
+#[derive(Serialize)]
+struct JobDetailResponse {
+    #[serde(flatten)]
+    job: JobResponse,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    children: Vec<JobResponse>,
+}
+
 async fn get_job(
     State(state): State<Arc<AppState>>,
     Path((vault_name, job_id)): Path<(String, Uuid)>,
-) -> ApiResult<Json<JobResponse>> {
+    Query(params): Query<GetJobParams>,
+) -> ApiResult<Json<JobDetailResponse>> {
     let vault = open_vault(&state, &vault_name)?;
     let job = vault.get_job(job_id)?.ok_or(archiveos_contract::VaultError::NotFound)?;
-    Ok(Json(JobResponse::from(job)))
+    let children = if params.include_children {
+        vault
+            .list_child_jobs(job_id)?
+            .into_iter()
+            .map(JobResponse::from)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Json(JobDetailResponse {
+        job: JobResponse::from(job),
+        children,
+    }))
 }
 
 async fn retry_job(
@@ -530,6 +668,15 @@ async fn retry_job(
 ) -> ApiResult<Json<JobResponse>> {
     let vault = open_vault(&state, &vault_name)?;
     let job = vault.retry_job(job_id)?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.cancel_job(job_id)?;
     Ok(Json(JobResponse::from(job)))
 }
 
@@ -544,6 +691,10 @@ struct JobResponse {
     lease_until: Option<String>,
     attempts: i32,
     created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<archiveos_contract::JobProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_job_id: Option<Uuid>,
 }
 
 impl From<archiveos_core::jobs::Job> for JobResponse {
@@ -557,6 +708,8 @@ impl From<archiveos_core::jobs::Job> for JobResponse {
             lease_until: j.lease_until,
             attempts: j.attempts,
             created_at: j.created_at,
+            progress: j.progress,
+            parent_job_id: j.parent_job_id,
         }
     }
 }
@@ -590,6 +743,7 @@ async fn claim_job(
 struct HeartbeatJobRequest {
     #[serde(default = "default_lease")]
     lease_secs: i64,
+    progress: Option<archiveos_contract::JobProgress>,
 }
 
 async fn heartbeat_job(
@@ -598,9 +752,13 @@ async fn heartbeat_job(
     body: Option<Json<HeartbeatJobRequest>>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let vault = open_vault(&state, &vault_name)?;
-    let lease_secs = body.map(|b| b.lease_secs).unwrap_or_else(default_lease);
-    vault.heartbeat_job(job_id, lease_secs)?;
-    Ok(Json(serde_json::json!({ "job_id": job_id, "ok": true })))
+    let lease_secs = body
+        .as_ref()
+        .map(|b| b.lease_secs)
+        .unwrap_or_else(default_lease);
+    let progress = body.as_ref().and_then(|b| b.progress.clone());
+    let cancelled = vault.heartbeat_job(job_id, lease_secs, progress.as_ref())?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "ok": true, "cancelled": cancelled })))
 }
 
 #[derive(Deserialize)]
@@ -649,7 +807,8 @@ async fn submit_manifest(
     let report = vault.import(&staging, Some(&body.manifest), ImportStrategy::Managed)?;
     let final_status = resolve_job_status(&body.manifest, body.status.as_deref());
     vault.finish_job(job_id, &final_status)?;
-    enqueue_preview_jobs_from_manifest(&vault, &vault_name, &body.manifest)?;
+    enqueue_preview_jobs_from_manifest(&vault, &vault_name, &body.manifest, job_id)?;
+    maybe_bind_subscription_collection(&vault, job_id, &body.manifest)?;
 
     Ok(Json(serde_json::json!({
         "job_id": job_id,
@@ -684,7 +843,7 @@ async fn finish_job(
         .map(|b| b.status.clone())
         .unwrap_or_else(default_finish_status);
     let final_status = match status.as_str() {
-        "done" | "partial" | "failed" => status,
+        "done" | "partial" | "failed" | "cancelled" => status,
         _ => "done".to_string(),
     };
     vault.finish_job(job_id, &final_status)?;
@@ -856,6 +1015,31 @@ struct SubscriptionResponse {
     status: String,
     created_at: String,
     options: Option<SubscriptionOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    collection_title: Option<String>,
+}
+
+impl From<archiveos_core::subscriptions::EnrichedSubscription> for SubscriptionResponse {
+    fn from(e: archiveos_core::subscriptions::EnrichedSubscription) -> Self {
+        let s = e.subscription;
+        Self {
+            id: s.id,
+            source: s.source,
+            kind: s.kind,
+            url: s.url,
+            target_vault: s.target_vault,
+            interval_minutes: s.interval_minutes,
+            next_run_at: s.next_run_at,
+            last_checked_at: s.last_checked_at,
+            status: s.status,
+            created_at: s.created_at,
+            options: s.options,
+            collection_id: e.collection_id,
+            collection_title: e.collection_title,
+        }
+    }
 }
 
 impl From<archiveos_core::subscriptions::SourceSubscription> for SubscriptionResponse {
@@ -872,6 +1056,8 @@ impl From<archiveos_core::subscriptions::SourceSubscription> for SubscriptionRes
             status: s.status,
             created_at: s.created_at,
             options: s.options,
+            collection_id: None,
+            collection_title: None,
         }
     }
 }
@@ -892,6 +1078,7 @@ async fn create_subscription(
             resync: body.resync,
             removed_items: body.removed_items,
             asset_policy: body.asset_policy,
+            ..Default::default()
         }),
     })?;
     Ok(Json(SubscriptionResponse::from(sub)))
@@ -902,8 +1089,17 @@ async fn list_subscriptions(
     Path(vault_name): Path<String>,
 ) -> ApiResult<Json<Vec<SubscriptionResponse>>> {
     let vault = open_vault(&state, &vault_name)?;
-    let subs = vault.list_subscriptions()?;
+    let subs = vault.list_enriched_subscriptions()?;
     Ok(Json(subs.into_iter().map(SubscriptionResponse::from).collect()))
+}
+
+async fn run_subscription(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.run_subscription_now(id, &vault_name)?;
+    Ok(Json(JobResponse::from(job)))
 }
 
 async fn delete_subscription(
@@ -913,6 +1109,49 @@ async fn delete_subscription(
     let vault = open_vault(&state, &vault_name)?;
     vault.delete_subscription(id)?;
     Ok(Json(serde_json::json!({ "removed": id })))
+}
+
+async fn get_media_preferences(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+) -> ApiResult<Json<UserMediaPreferences>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(vault.get_media_preferences()?))
+}
+
+async fn set_media_preferences(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Json(body): Json<UserMediaPreferences>,
+) -> ApiResult<Json<UserMediaPreferences>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(vault.set_media_preferences(&body)?))
+}
+
+#[derive(Deserialize)]
+struct RefreshFromSourceRequest {
+    #[serde(default)]
+    metadata_only: bool,
+}
+
+async fn refresh_entity_from_source(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id)): Path<(String, Uuid)>,
+    body: Option<Json<RefreshFromSourceRequest>>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let metadata_only = body.map(|b| b.metadata_only).unwrap_or(false);
+    let job = vault.refresh_entity_from_source(&vault_name, entity_id, metadata_only)?;
+    Ok(Json(JobResponse::from(job)))
+}
+
+async fn refresh_collection_from_source(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, collection_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<JobResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.refresh_collection_from_source(&vault_name, collection_id)?;
+    Ok(Json(JobResponse::from(job)))
 }
 
 #[derive(Serialize)]
@@ -1083,6 +1322,145 @@ async fn list_collection_members(
     ))
 }
 
+#[derive(Deserialize)]
+struct LibraryListParams {
+    section: Option<String>,
+    source: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LibraryListDetailParams {
+    sort: Option<String>,
+    section: Option<String>,
+    source: Option<String>,
+    kind: Option<String>,
+}
+
+async fn list_library_lists(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Query(params): Query<LibraryListParams>,
+) -> ApiResult<Json<Vec<archiveos_contract::LibraryListSummary>>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(vault.list_library_lists(&library_query_from_params(params))?))
+}
+
+fn library_query_from_params(params: LibraryListParams) -> LibraryListQuery {
+    let mut source = params.source;
+    let mut kind = params.kind;
+    match params.section.as_deref() {
+        Some("youtube") => {
+            source = Some("youtube".into());
+            kind = Some("video".into());
+        }
+        Some("videos") => kind = Some("video".into()),
+        Some("music") => kind = Some("audio".into()),
+        Some("pictures") => kind = Some("image".into()),
+        _ => {}
+    }
+    LibraryListQuery {
+        section: params.section,
+        source,
+        kind,
+    }
+}
+
+async fn get_library_list(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, list_id)): Path<(String, String)>,
+    Query(params): Query<LibraryListDetailParams>,
+) -> ApiResult<Json<archiveos_contract::LibraryListDetail>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let scope = library_query_from_params(LibraryListParams {
+        section: params.section,
+        source: params.source,
+        kind: params.kind,
+    });
+    Ok(Json(
+        vault.get_library_list(&list_id, params.sort.as_deref(), Some(&scope))?,
+    ))
+}
+
+async fn get_playback_state(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<archiveos_contract::PlaybackStateResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault
+        .get_playback_state(entity_id)?
+        .map(Json)
+        .ok_or_else(|| archiveos_contract::VaultError::NotFound.into())
+}
+
+async fn upsert_playback_state(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id)): Path<(String, Uuid)>,
+    Json(body): Json<PlaybackStateInput>,
+) -> ApiResult<Json<archiveos_contract::PlaybackStateResponse>> {
+    let vault = open_vault(&state, &vault_name)?;
+    Ok(Json(vault.upsert_playback_state(entity_id, &body)?))
+}
+
+async fn dismiss_playback_state(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, entity_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.dismiss_playback_state(entity_id)?;
+    Ok(Json(serde_json::json!({ "entity_id": entity_id, "status": "dismissed" })))
+}
+
+async fn create_user_list(
+    State(state): State<Arc<AppState>>,
+    Path(vault_name): Path<String>,
+    Json(body): Json<CreateUserListInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let list_id = vault.create_user_list(&body)?;
+    Ok(Json(serde_json::json!({ "id": list_id })))
+}
+
+async fn add_user_list_member(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, list_id)): Path<(String, Uuid)>,
+    Json(body): Json<AddUserListMemberInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.add_user_list_member(list_id, &body)?;
+    Ok(Json(serde_json::json!({
+        "list_id": list_id,
+        "entity_id": body.entity_id,
+        "status": "added",
+    })))
+}
+
+async fn remove_user_list_member(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, list_id, entity_id)): Path<(String, Uuid, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.remove_user_list_member(list_id, entity_id)?;
+    Ok(Json(serde_json::json!({
+        "list_id": list_id,
+        "entity_id": entity_id,
+        "status": "removed",
+    })))
+}
+
+async fn reorder_user_list_members(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, list_id)): Path<(String, Uuid)>,
+    Json(body): Json<ReorderUserListMembersInput>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.reorder_user_list_members(list_id, &body.entity_ids)?;
+    Ok(Json(serde_json::json!({
+        "list_id": list_id,
+        "status": "reordered",
+    })))
+}
+
 async fn regenerate_previews(
     State(state): State<Arc<AppState>>,
     Path((vault_name, entity_id)): Path<(String, Uuid)>,
@@ -1126,10 +1504,50 @@ async fn commit_preview_job(
     })))
 }
 
+fn maybe_bind_subscription_collection(
+    vault: &Vault,
+    job_id: Uuid,
+    manifest: &ImportManifest,
+) -> Result<(), archiveos_contract::VaultError> {
+    let Some(collection) = &manifest.collection else {
+        return Ok(());
+    };
+    let Some(job) = vault.get_job(job_id)? else {
+        return Ok(());
+    };
+    let input = YtdlpJobInput::normalize(&job.input)?;
+    if input.mode != "subscription" {
+        return Ok(());
+    }
+    let entity_id = archiveos_core::import::db::find_entity_id_by_source_url(
+        vault.connection(),
+        &collection.url,
+    )?
+    .or_else(|| {
+        archiveos_core::import::db::find_entity_by_source_ref(
+            vault.connection(),
+            manifest.source_identity.as_deref().unwrap_or("youtube"),
+            "playlist",
+            &collection.external_id,
+        )
+        .ok()
+        .flatten()
+    });
+    let Some(entity_id) = entity_id else {
+        return Ok(());
+    };
+    archiveos_core::subscriptions::bind_subscription_collection(
+        vault.connection(),
+        &input.url,
+        entity_id,
+    )
+}
+
 fn enqueue_preview_jobs_from_manifest(
     vault: &Vault,
     vault_name: &str,
     manifest: &ImportManifest,
+    parent_job_id: Uuid,
 ) -> Result<(), archiveos_contract::VaultError> {
     for item in &manifest.items {
         if item.status != "complete" {
@@ -1147,7 +1565,7 @@ fn enqueue_preview_jobs_from_manifest(
         else {
             continue;
         };
-        let _ = vault.maybe_enqueue_preview_job(vault_name, entity_id)?;
+        let _ = vault.maybe_enqueue_preview_job(vault_name, entity_id, Some(parent_job_id))?;
     }
     Ok(())
 }

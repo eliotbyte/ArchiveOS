@@ -339,6 +339,28 @@ pub fn has_present_asset(conn: &Connection, entity_id: Uuid) -> Result<bool, Vau
     Ok(found != 0)
 }
 
+/// Marks other present assets of the same kind on an entity as missing after a replacement import.
+pub fn supersede_present_assets(
+    conn: &Connection,
+    entity_id: Uuid,
+    kind: &str,
+    keep_asset_id: Uuid,
+) -> Result<(), VaultError> {
+    conn.execute(
+        "UPDATE entity_asset
+         SET status = 'missing', updated_at = ?1, deleted_at = NULL
+         WHERE entity_id = ?2 AND kind = ?3 AND status = 'present' AND id != ?4",
+        params![
+            Utc::now().to_rfc3339(),
+            entity_id.to_string(),
+            kind,
+            keep_asset_id.to_string(),
+        ],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 pub fn mark_asset_status(
     conn: &Connection,
     asset_id: Uuid,

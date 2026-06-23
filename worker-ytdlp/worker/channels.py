@@ -27,9 +27,8 @@ def channel_from_info(info: dict[str, Any]) -> dict[str, Any] | None:
         metadata["uploader_id"] = uploader_id
     if uploader_url := info.get("uploader_url"):
         metadata["uploader_url"] = uploader_url
-    thumbnails = info.get("thumbnails") or []
-    if thumbnails:
-        metadata["thumbnail_url"] = thumbnails[-1].get("url")
+    if channel_url := info.get("channel_url"):
+        metadata["channel_url"] = channel_url
 
     return {
         "source": source,

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use archiveos_contract::{
     ImportManifest, ImportReport, ImportStrategy, ManifestAssetCatalogEntry, ManifestChannel,
-    ManifestItem, ManifestRelation, ManifestSourceRef, VaultError,
+    ManifestChannelAvatar, ManifestItem, ManifestRelation, ManifestSourceRef, VaultError,
 };
 use chrono::Utc;
 use rusqlite::Connection;
@@ -47,7 +47,7 @@ fn import_from_manifest(
     report: &mut ImportReport,
 ) -> Result<(), VaultError> {
     for channel in &manifest.channels {
-        import_channel(conn, channel)?;
+        import_channel(vault, conn, staging_dir, strategy, channel)?;
     }
 
     if let Some(collection) = &manifest.collection {
@@ -100,7 +100,13 @@ fn import_from_manifest(
     Ok(())
 }
 
-fn import_channel(conn: &Connection, channel: &ManifestChannel) -> Result<Uuid, VaultError> {
+fn import_channel(
+    vault: &Vault,
+    conn: &Connection,
+    staging_dir: &Path,
+    strategy: ImportStrategy,
+    channel: &ManifestChannel,
+) -> Result<Uuid, VaultError> {
     let entity_id = if let Some(existing) =
         db::find_entity_by_source_ref(conn, &channel.source, &channel.kind, &channel.external_id)?
     {
@@ -127,7 +133,72 @@ fn import_channel(conn: &Connection, channel: &ManifestChannel) -> Result<Uuid, 
     }
     ingest_metadata_by_provenance(conn, entity_id, &channel.metadata_by_provenance)?;
 
+    if let Some(avatar) = &channel.avatar {
+        import_channel_avatar(vault, conn, staging_dir, strategy, entity_id, avatar)?;
+    }
+
     Ok(entity_id)
+}
+
+fn import_channel_avatar(
+    vault: &Vault,
+    conn: &Connection,
+    staging_dir: &Path,
+    strategy: ImportStrategy,
+    channel_entity_id: Uuid,
+    avatar: &ManifestChannelAvatar,
+) -> Result<(), VaultError> {
+    let file_path = resolve_item_path(staging_dir, &avatar.path, strategy)?;
+    let ext = extension_from_path(&file_path);
+
+    let (content_hash, size, mime, asset_path) = match strategy {
+        ImportStrategy::Managed => {
+            let cas = cas::store_managed(vault.root(), &file_path, &ext)?;
+            (
+                cas.content_hash,
+                cas.size,
+                guess_mime(&cas.blob_path),
+                Some(cas.blob_path.to_string_lossy().into_owned()),
+            )
+        }
+        ImportStrategy::Reference => {
+            let hash = cas::hash_file(&file_path)?;
+            let size = fs::metadata(&file_path)?.len();
+            let path_str = file_path
+                .canonicalize()
+                .unwrap_or(file_path.clone())
+                .to_string_lossy()
+                .into_owned();
+            (hash, size, guess_mime(&file_path), Some(path_str))
+        }
+    };
+
+    let asset_id = crate::assets::upsert_preview_asset(
+        conn,
+        channel_entity_id,
+        "avatar",
+        "avatar",
+        &UpsertAssetInput {
+            entity_id: channel_entity_id,
+            role: "supporting",
+            kind: "avatar",
+            content_hash: Some(&content_hash),
+            mime: Some(&mime),
+            size,
+            ext: Some(&ext),
+            status: "present",
+            storage_strategy: match strategy {
+                ImportStrategy::Managed => "managed",
+                ImportStrategy::Reference => "reference",
+            },
+            path: asset_path.as_deref(),
+        },
+    )?;
+    crate::assets::upsert_asset_metadata(conn, asset_id, "preview_role", "avatar", "archiveos")?;
+    if let Some(source_url) = &avatar.source_url {
+        crate::assets::upsert_asset_metadata(conn, asset_id, "source_url", source_url, "archiveos")?;
+    }
+    Ok(())
 }
 
 fn import_relation(conn: &Connection, relation: &ManifestRelation) -> Result<(), VaultError> {
@@ -280,7 +351,7 @@ fn import_manifest_item(
     db::update_entity_content(conn, entity_id, &content_hash, &mime, size)?;
 
     let (asset_role, asset_kind) = asset_role_and_kind(item.source_ref.as_ref());
-    crate::assets::upsert_asset(
+    let asset_id = crate::assets::upsert_asset(
         conn,
         &UpsertAssetInput {
             entity_id,
@@ -298,6 +369,9 @@ fn import_manifest_item(
             path: asset_path.as_deref(),
         },
     )?;
+    if asset_kind == "thumbnail" {
+        crate::assets::supersede_present_assets(conn, entity_id, "thumbnail", asset_id)?;
+    }
 
     if strategy == ImportStrategy::Reference {
         if let Some(path_str) = &asset_path {
@@ -1145,6 +1219,7 @@ mod tests {
                 "verified": true
             })),
             metadata_by_provenance: Default::default(),
+            avatar: None,
         });
         manifest.relations.push(ManifestRelation {
             source: "youtube".into(),
@@ -1182,6 +1257,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relation_count, 1);
+    }
+
+    #[test]
+    fn import_channel_avatar_asset_on_channel_entity() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let staging = dir.path().join("staging/job-1");
+        let avatar = staging.join("files/UC123.jpg");
+        fs::create_dir_all(avatar.parent().unwrap()).unwrap();
+        fs::write(&avatar, b"avatar-bytes").unwrap();
+
+        let manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            source_identity: None,
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![ManifestChannel {
+                source: "youtube".into(),
+                kind: "channel".into(),
+                external_id: "UC123".into(),
+                url: Some("https://youtube.com/channel/UC123".into()),
+                metadata: Some(serde_json::json!({ "title": "Avatar Channel" })),
+                metadata_by_provenance: Default::default(),
+                avatar: Some(ManifestChannelAvatar {
+                    path: "files/UC123.jpg".into(),
+                    source_url: Some("https://example.com/avatar.jpg".into()),
+                }),
+            }],
+            items: vec![],
+            membership: vec![],
+            relations: vec![],
+        };
+
+        import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+
+        let channel_entity_id: String = vault
+            .connection()
+            .query_row(
+                "SELECT entity_id FROM source_ref WHERE kind = 'channel' AND external_id = 'UC123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let avatar_count: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM entity_asset
+                 WHERE entity_id = ?1 AND kind = 'avatar' AND status = 'present'",
+                [&channel_entity_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(avatar_count, 1);
     }
 
     #[test]
@@ -1361,6 +1491,155 @@ mod tests {
             )
             .unwrap();
         assert_eq!(thumb_assets, 1);
+    }
+
+    #[test]
+    fn import_thumbnail_reimport_supersedes_previous_asset() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let staging = dir.path().join("staging/job-1");
+        let thumb_v1 = staging.join("files/vid123.webp");
+        let thumb_v2 = staging.join("files/vid123.jpg");
+        fs::create_dir_all(thumb_v1.parent().unwrap()).unwrap();
+        fs::write(&thumb_v1, b"small-thumb").unwrap();
+        fs::write(&thumb_v2, b"much-larger-thumbnail-bytes").unwrap();
+
+        let mut manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            source_identity: None,
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![],
+            items: vec![ManifestItem {
+                path: "files/vid123.webp".into(),
+                sha256: None,
+                status: "complete".into(),
+                source_ref: Some(ManifestSourceRef {
+                    source: "youtube".into(),
+                    kind: "thumbnail".into(),
+                    external_id: "vid123:thumbnail".into(),
+                    url: Some("https://example.com/thumb.webp".into()),
+                }),
+                metadata: None,
+                metadata_by_provenance: Default::default(),
+                assets: vec![],
+            }],
+            membership: vec![],
+            relations: vec![],
+        };
+
+        import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+        manifest.items[0].path = "files/vid123.jpg".into();
+        fs::create_dir_all(thumb_v2.parent().unwrap()).unwrap();
+        fs::write(&thumb_v2, b"much-larger-thumbnail-bytes").unwrap();
+        import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+
+        let present: i32 = vault
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM entity_asset ea
+                 JOIN source_ref sr ON sr.entity_id = ea.entity_id
+                 WHERE sr.external_id = 'vid123:thumbnail' AND ea.kind = 'thumbnail'
+                   AND ea.status = 'present'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(present, 1);
+
+        let size: i64 = vault
+            .connection()
+            .query_row(
+                "SELECT ea.size FROM entity_asset ea
+                 JOIN source_ref sr ON sr.entity_id = ea.entity_id
+                 WHERE sr.external_id = 'vid123:thumbnail' AND ea.kind = 'thumbnail'
+                   AND ea.status = 'present'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(size > 10);
+    }
+
+    #[test]
+    fn superseded_thumbnail_blob_removed_by_gc() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let staging = dir.path().join("staging/job-1");
+        let thumb_v1 = staging.join("files/vid123.webp");
+        let thumb_v2 = staging.join("files/vid123.jpg");
+        fs::create_dir_all(thumb_v1.parent().unwrap()).unwrap();
+        fs::write(&thumb_v1, b"small-thumb").unwrap();
+        fs::write(&thumb_v2, b"much-larger-thumbnail-bytes").unwrap();
+
+        let mut manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            source_identity: None,
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![],
+            items: vec![ManifestItem {
+                path: "files/vid123.webp".into(),
+                sha256: None,
+                status: "complete".into(),
+                source_ref: Some(ManifestSourceRef {
+                    source: "youtube".into(),
+                    kind: "thumbnail".into(),
+                    external_id: "vid123:thumbnail".into(),
+                    url: Some("https://example.com/thumb.webp".into()),
+                }),
+                metadata: None,
+                metadata_by_provenance: Default::default(),
+                assets: vec![],
+            }],
+            membership: vec![],
+            relations: vec![],
+        };
+
+        import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+        manifest.items[0].path = "files/vid123.jpg".into();
+        fs::create_dir_all(thumb_v2.parent().unwrap()).unwrap();
+        fs::write(&thumb_v2, b"much-larger-thumbnail-bytes").unwrap();
+        import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+
+        let old_hash: String = vault
+            .connection()
+            .query_row(
+                "SELECT content_hash FROM entity_asset
+                 WHERE kind = 'thumbnail' AND status = 'missing'
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let new_hash: String = vault
+            .connection()
+            .query_row(
+                "SELECT content_hash FROM entity_asset
+                 WHERE kind = 'thumbnail' AND status = 'present'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_blob = crate::layout::blob_path(vault.root(), &old_hash, ".webp")
+            .or_else(|_| crate::layout::find_blob_path(vault.root(), &old_hash, None, Some("image/webp")))
+            .unwrap();
+        let new_blob = crate::layout::find_blob_path(
+            vault.root(),
+            &new_hash,
+            Some(".jpg"),
+            Some("image/jpeg"),
+        )
+        .unwrap();
+        assert!(old_blob.exists());
+        assert!(new_blob.exists());
+
+        let report = vault.reconcile_blobs(false, 0).unwrap();
+        assert_eq!(report.removed, 1);
+        assert!(!old_blob.exists());
+        assert!(new_blob.exists());
     }
 
     #[test]

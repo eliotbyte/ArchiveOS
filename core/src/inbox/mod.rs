@@ -252,7 +252,7 @@ fn import_file(
     )?;
 
     if let Some(vault_name) = target_vault {
-        let _ = crate::preview::maybe_enqueue_preview_job(conn, vault_name, entity_id)?;
+        let _ = crate::preview::maybe_enqueue_preview_job(conn, vault_name, entity_id, None)?;
     }
 
     Ok(entity_id)

@@ -37,6 +37,8 @@ pub struct AssetPolicy {
     pub video: String,
     #[serde(default = "default_true")]
     pub thumbnail: bool,
+    #[serde(default = "default_true")]
+    pub channel_avatar: bool,
     #[serde(default = "default_subtitles")]
     pub subtitles: String,
     #[serde(default = "default_subtitle_languages")]
@@ -54,6 +56,7 @@ impl Default for AssetPolicy {
         Self {
             video: default_video(),
             thumbnail: default_true(),
+            channel_avatar: default_true(),
             subtitles: default_subtitles(),
             subtitle_languages: default_subtitle_languages(),
             automatic_subtitles: default_true(),
@@ -126,6 +129,8 @@ pub struct SubscriptionOptions {
     pub removed_items: String,
     #[serde(default)]
     pub asset_policy: AssetPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection_entity_id: Option<String>,
 }
 
 impl Default for SubscriptionOptions {
@@ -134,6 +139,7 @@ impl Default for SubscriptionOptions {
             resync: default_true(),
             removed_items: default_removed_items(),
             asset_policy: AssetPolicy::default(),
+            collection_entity_id: None,
         }
     }
 }

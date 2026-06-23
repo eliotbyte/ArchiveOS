@@ -14,12 +14,20 @@ def normalize_extractor_key(raw: str | None) -> str | None:
     return key or None
 
 
+def canonical_platform_source(raw: str) -> str:
+    """Map yt-dlp extractor variants to stable platform ids used in source_ref."""
+    key = raw.lower().strip()
+    if key.startswith("youtube"):
+        return "youtube"
+    return key
+
+
 def extractor_from_info(info: dict[str, Any] | None) -> str:
     if not info:
         return "unknown"
     for field in ("extractor_key", "extractor", "ie_key"):
         if normalized := normalize_extractor_key(info.get(field)):
-            return normalized
+            return canonical_platform_source(normalized)
     if webpage_url := info.get("webpage_url") or info.get("original_url"):
         return extractor_from_url(str(webpage_url))
     return "unknown"

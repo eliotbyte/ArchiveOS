@@ -1,4 +1,5 @@
 import type { EntityListItem } from "../api/client";
+import { isYtdlpSource } from "../integrations/ytdlp";
 
 export type SectionViewMode = "grid" | "gallery" | "youtube";
 
@@ -87,6 +88,9 @@ export function sectionBrowseParams(
   if (query) params.query = query;
   if (section.browse.kind) params.kind = section.browse.kind;
   if (section.browse.source) params.source = section.browse.source;
+  if (section.browse.excludeSource) {
+    params.exclude_source = section.browse.excludeSource;
+  }
   return params;
 }
 
@@ -95,7 +99,7 @@ export function filterSectionItems(
   section: LibrarySection,
 ): EntityListItem[] {
   if (!section.browse.excludeSource) return items;
-  return items.filter((item) => item.source !== section.browse.excludeSource);
+  return items.filter((item) => !isYtdlpSource(item.source));
 }
 
 export function isYouTubeCollection(collectionType: string): boolean {

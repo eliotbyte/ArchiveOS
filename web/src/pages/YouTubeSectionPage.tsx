@@ -1,22 +1,19 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { ApiError, type CollectionSummary, type EntityListItem } from "../api/client";
-import YouTubeVideoCard, { PlaylistCard } from "../components/youtube/YouTubeCards";
+import { ApiError, BROWSE_SORT_LABELS, type BrowseSort, type EntityListItem, type LibraryListSummary } from "../api/client";
+import YouTubeVideoCard, { LibraryListCard } from "../components/youtube/YouTubeCards";
 import { useVideoPlayer } from "../context/VideoPlayerContext";
 import { useVaultApi } from "../context/VaultContext";
-import {
-  getSectionById,
-  isYouTubeCollection,
-  sectionBrowseParams,
-} from "../library/sections";
+import { getSectionById, sectionBrowseParams } from "../library/sections";
 
 export default function YouTubeSectionPage() {
   const section = getSectionById("youtube")!;
   const api = useVaultApi();
   const { playEntity } = useVideoPlayer();
   const [videos, setVideos] = useState<EntityListItem[]>([]);
-  const [collections, setCollections] = useState<CollectionSummary[]>([]);
+  const [libraryLists, setLibraryLists] = useState<LibraryListSummary[]>([]);
   const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<BrowseSort>("added_desc");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -25,27 +22,28 @@ export default function YouTubeSectionPage() {
       setLoading(true);
       setError(null);
       try {
-        const [videoItems, allCollections] = await Promise.all([
-          api.listEntities(sectionBrowseParams(section, query.trim())),
-          api.listCollections({ min_member_count: 1 }),
+        const [videoItems, lists] = await Promise.all([
+          api.listEntities({
+            ...sectionBrowseParams(section, query.trim()),
+            sort,
+          }),
+          api.listLibraryLists({ section: "youtube" }),
         ]);
         setVideos(videoItems);
-        setCollections(
-          allCollections.filter(
-            (collection) =>
-              isYouTubeCollection(collection.collection_type) &&
-              collection.member_count > 0,
-          ),
-        );
+        setLibraryLists(lists);
       } catch (err) {
         setError(err instanceof ApiError ? err.message : "Failed to load YouTube section");
         setVideos([]);
-        setCollections([]);
+        setLibraryLists([]);
       } finally {
         setLoading(false);
       }
     })();
-  }, [api, query, section]);
+  }, [api, query, section, sort]);
+
+  const smartLists = libraryLists.filter((list) => list.list_kind === "smart");
+  const userLists = libraryLists.filter((list) => list.list_kind === "user");
+  const sourceLists = libraryLists.filter((list) => list.list_kind === "source");
 
   return (
     <section className="youtube-page">
@@ -65,10 +63,24 @@ export default function YouTubeSectionPage() {
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
+        <label className="yt-sort-control inline">
+          Sort
+          <select
+            value={sort}
+            onChange={(event) => setSort(event.target.value as BrowseSort)}
+          >
+            <option value="added_desc">{BROWSE_SORT_LABELS.added_desc}</option>
+            <option value="published_desc">{BROWSE_SORT_LABELS.published_desc}</option>
+            <option value="views_desc">{BROWSE_SORT_LABELS.views_desc}</option>
+          </select>
+        </label>
         <button
           className="secondary"
           type="button"
-          onClick={() => setQuery("")}
+          onClick={() => {
+            setQuery("");
+            setSort("added_desc");
+          }}
         >
           Reset
         </button>
@@ -77,12 +89,34 @@ export default function YouTubeSectionPage() {
       {loading ? <div className="loading-state">Loading YouTube...</div> : null}
       {error ? <div className="error-state">{error}</div> : null}
 
-      {!loading && collections.length > 0 ? (
+      {!loading && smartLists.length > 0 ? (
+        <section className="youtube-shelf">
+          <h3>For you</h3>
+          <div className="youtube-playlist-grid">
+            {smartLists.map((list) => (
+              <LibraryListCard key={list.id} list={list} />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {!loading && userLists.length > 0 ? (
+        <section className="youtube-shelf">
+          <h3>Your lists</h3>
+          <div className="youtube-playlist-grid">
+            {userLists.map((list) => (
+              <LibraryListCard key={list.id} list={list} />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {!loading && sourceLists.length > 0 ? (
         <section className="youtube-shelf">
           <h3>Playlists &amp; channels</h3>
           <div className="youtube-playlist-grid">
-            {collections.map((collection) => (
-              <PlaylistCard key={collection.id} collection={collection} />
+            {sourceLists.map((list) => (
+              <LibraryListCard key={list.id} list={list} />
             ))}
           </div>
         </section>
@@ -103,6 +137,9 @@ export default function YouTubeSectionPage() {
                   key={entity.id}
                   entity={entity}
                   onPlay={playEntity}
+                  onDeleted={(id) =>
+                    setVideos((items) => items.filter((item) => item.id !== id))
+                  }
                 />
               ))}
             </div>

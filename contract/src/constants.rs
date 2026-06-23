@@ -10,5 +10,5 @@ pub const WORKER_THUMBNAIL: &str = "thumbnail";
 pub const WORKER_COOKIES_DIR: &str = "cookies";
 pub const WORKER_CACHE_DIR: &str = "cache";
 pub const LAYOUT_VERSION: u32 = 1;
-pub const DB_SCHEMA_VERSION: i32 = 7;
+pub const DB_SCHEMA_VERSION: i32 = 12;
 pub const REGISTRY_DB: &str = "registry.sqlite";

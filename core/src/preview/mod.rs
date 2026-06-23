@@ -17,6 +17,8 @@ pub const ROLE_TIMELINE_MANIFEST: &str = "timeline_manifest";
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct PreviewJobInput {
     pub entity_id: Uuid,
+    #[serde(default)]
+    pub parent_job_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -68,7 +70,7 @@ pub fn backfill_preview_jobs(
         let entity_id = Uuid::parse_str(&id_str).map_err(|e| VaultError::InvalidLayout {
             detail: e.to_string(),
         })?;
-        match maybe_enqueue_preview_job(conn, target_vault, entity_id)? {
+        match maybe_enqueue_preview_job(conn, target_vault, entity_id, None)? {
             Some(_) => report.queued += 1,
             None => report.skipped += 1,
         }
@@ -81,6 +83,7 @@ pub fn maybe_enqueue_preview_job(
     conn: &Connection,
     target_vault: &str,
     entity_id: Uuid,
+    parent_job_id: Option<Uuid>,
 ) -> Result<Option<jobs::Job>, VaultError> {
     if assets::find_asset_by_preview_role(conn, entity_id, ROLE_PREVIEW_IMAGE_SMALL)?.is_some() {
         return Ok(None);
@@ -106,9 +109,20 @@ pub fn maybe_enqueue_preview_job(
         return Ok(None);
     }
 
-    let input = serde_json::json!({ "entity_id": entity_id });
-    jobs::create_job(conn, JOB_TYPE_PREVIEW, target_vault, &input.to_string())
-        .map(Some)
+    let mut input = serde_json::json!({ "entity_id": entity_id });
+    if let Some(parent) = parent_job_id {
+        input["parent_job_id"] = serde_json::Value::String(parent.to_string());
+    }
+    jobs::create_job_with_options(
+        conn,
+        jobs::CreateJobOptions {
+            job_type: JOB_TYPE_PREVIEW,
+            target_vault,
+            input: &input.to_string(),
+            parent_job_id,
+        },
+    )
+    .map(Some)
 }
 
 fn pending_preview_job_for_entity(
@@ -241,7 +255,7 @@ mod tests {
         )
         .unwrap();
 
-        let job = maybe_enqueue_preview_job(vault.connection(), "vault", entity_id)
+        let job = maybe_enqueue_preview_job(vault.connection(), "vault", entity_id, None)
             .unwrap()
             .expect("job");
         assert_eq!(job.job_type, JOB_TYPE_PREVIEW);

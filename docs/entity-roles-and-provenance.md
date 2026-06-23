@@ -8,6 +8,8 @@ Primary entities have no visibility=hidden. Supporting assets carry entity_role=
 
 YouTube thumbnails are a compatibility wrapper during the entity/asset transition: import still creates a hidden supporting thumbnail entity (for entity_relation thumbnail, hidden search behavior, and thumbnail_external_id on the parent video), and also writes an entity_asset row with role=supporting and kind=thumbnail on that hidden entity. Canonical bytes for thumbnails live in entity_asset; the hidden entity keeps graph/search compatibility until UI/API can address assets directly.
 
+Channel/uploader entities may carry an optional avatar asset: entity_asset with role=supporting, kind=avatar, preview_role=avatar on the channel entity itself (no hidden wrapper). When the source exposes no stable avatar URL, the worker skips avatar download and the UI omits the avatar column.
+
 Each metadata row has a provenance label saying where the value came from:
 
 user — manual edits and overrides

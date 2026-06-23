@@ -32,9 +32,11 @@ Entity status answers: should this logical object be visible and managed?
 
 Asset status answers: do we have usable bytes?
 
-- `present`: bytes/path are available.
+- `present`: bytes/path are available. **Pins** the managed CAS blob.
+- `missing`: replaced during metadata refresh or marked unavailable; historical
+  row kept for import history. **Does not pin** the blob.
 - `missing_local`: ArchiveOS expected local bytes, but filesystem reconciliation
-  could not find them.
+  could not find them. **Does not pin** the blob.
 - `deleted_by_user`: user intentionally deleted this asset through ArchiveOS.
 - `download_failed`: acquisition failed before usable bytes were committed.
 - `partial`: incomplete bytes exist but are not usable.
@@ -58,7 +60,7 @@ Membership status answers: is this entity still part of this source aggregate?
 
 | Scenario | Entity | Asset | Source ref | Membership |
 | --- | --- | --- | --- | --- |
-| User deletes logical video | `user_deleted` | `deleted_by_user` after blob removal | preserved | unchanged unless explicitly removed |
+| User deletes logical video | `user_deleted` | `deleted_by_user`; CAS blob removed when refcount reaches 0 | preserved | unchanged unless explicitly removed |
 | User deletes only local file | unchanged | `deleted_by_user` | preserved | unchanged |
 | File disappears outside ArchiveOS | unchanged | `missing_local` | preserved | unchanged |
 | YouTube video is deleted/private | usually `active` | unchanged | `dead` or specific unavailable status | unchanged |
@@ -67,6 +69,11 @@ Membership status answers: is this entity still part of this source aggregate?
 
 Workers may redownload only when the entity is not `user_deleted`, the source is
 not permanently dead, and no `present` asset satisfies the requested role/kind.
+
+**UI behavior:** deleting a video from the library sets `user_deleted` and hides
+it from browse/search; yt-dlp monitors and playlist resync skip it. Removing a
+video from a source playlist sets membership to `user_removed` without deleting
+the entity; resync does not re-add it.
 
 ## yt-dlp Source Mapping
 
@@ -82,6 +89,7 @@ Each supported extractor maps the same way:
 - Thumbnail → hidden supporting entity (transition) plus `entity_asset` with `kind=thumbnail`
 - Playlist / uploads feed → collection with `collection.type=<extractor>_playlist` or `<extractor>_channel_uploads`
 - Channel / uploader → `source_ref(kind=channel)` only when a stable `channel_id` or `uploader_id` exists
+- Channel avatar → optional `entity_asset` on the channel entity with `role=supporting`, `kind=avatar`, `status=present`, and `entity_asset_metadata.preview_role=avatar`. Omitted when the extractor provides no stable author page or avatar URL.
 - Subtitles and audio tracks → `entity_asset` rows on the video entity with `status=remote`, `storage_strategy=remote`, and asset metadata (`language`, `caption_kind`, `format_id`, `source_url`, `source_page_url`, …) in `entity_asset_metadata`
 
 Remote track acquisition:
@@ -112,9 +120,17 @@ Legacy manifests without `source_identity` still default membership/collection i
   video, even when some videos are not downloaded.
 - YouTube channel/uploads URL creates a channel entity and a collection entity
   with `collection.type=youtube_channel_uploads`.
+- When the worker can probe the author page, it downloads the channel avatar
+  onto the channel entity (not the video). Video cards and
+  `GET /vaults/{vault}/channels/{channel_id}` expose the avatar preview when
+  present.
 
 ## API Notes
 
+- `GET /vaults/{vault}/channels/{channel_id}` returns channel title, description,
+  follower count, and avatar preview.
+- `GET /vaults/{vault}/channels/{channel_id}/videos` returns browse-like video
+  rows for videos linked through `entity_relation.relation=uploaded_by`.
 - `GET /vaults/{vault}/entities/{id}` returns legacy top-level `content_hash`,
   `mime`, and `size` plus canonical `assets[]`. Each asset includes `metadata`
   (flattened best-value map) and `metadata_entries` (provenance-aware rows from
@@ -126,11 +142,22 @@ Legacy manifests without `source_identity` still default membership/collection i
   from `staging/{job_id}` into CAS and marks the asset `present`.
 - `DELETE /vaults/{vault}/collections/{collection_id}/members/{entity_id}` sets
   membership status to `user_removed` without deleting the entity or assets.
-- `POST /vaults/{vault}/reconcile/assets` marks present assets whose paths are
-  missing as `missing_local`.
+- `POST /vaults/{vault}/reconcile/assets` marks present assets whose managed
+  blobs or reference paths are missing as `missing_local`.
 - Set `ARCHIVEOS_ASSET_RECONCILE_SECS` (and `ARCHIVEOS_DEFAULT_VAULT`) to run
   asset reconciliation periodically; disable with
   `ARCHIVEOS_ASSET_RECONCILE_SCHEDULER=off`.
+- `POST /vaults/{vault}/reconcile/blobs?dry_run=true` reports unreferenced CAS
+  blobs (default `dry_run=true`). Use `dry_run=false` to delete blobs with
+  refcount 0 older than `min_age_secs` (default from
+  `ARCHIVEOS_BLOB_GC_MIN_AGE_SECS`, 86400).
+- Set `ARCHIVEOS_BLOB_GC_SCHEDULER=on`, `ARCHIVEOS_BLOB_GC_SECS`, and
+  `ARCHIVEOS_BLOB_GC_MIN_AGE_SECS` to sweep orphan blobs on a schedule.
+
+Managed blobs are **pinned** when referenced by any `entity_asset` with
+`status=present` and `storage_strategy=managed`, or by any `entity` with
+`status=active` and `content_hash` set (legacy dedup). Shared hashes are only
+deleted when the last pin is released.
 
 See [video-archive-mvp.md](video-archive-mvp.md) for structured archive jobs,
 asset policy, subscriptions, cookies, and preview semantics.

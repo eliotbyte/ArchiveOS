@@ -88,6 +88,56 @@ pub fn migrate(conn: &Connection) -> Result<(), VaultError> {
             .map_err(db_err)?;
         conn.execute(
             "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![7, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 7 {
+        conn.execute_batch(include_str!("../../migrations/008_user_library.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![8, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 8 {
+        conn.execute_batch(include_str!("../../migrations/009_user_media_preference.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![9, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 9 {
+        conn.execute_batch(include_str!("../../migrations/010_job_progress.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![10, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 10 {
+        conn.execute_batch(include_str!("../../migrations/011_youtube_source_canonical.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
+            rusqlite::params![11, Utc::now().to_rfc3339()],
+        )
+        .map_err(db_err)?;
+    }
+
+    if current <= 11 {
+        conn.execute_batch(include_str!("../../migrations/012_youtube_source_repair.sql"))
+            .map_err(db_err)?;
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (?1, ?2)",
             rusqlite::params![DB_SCHEMA_VERSION, Utc::now().to_rfc3339()],
         )
         .map_err(db_err)?;
@@ -233,5 +283,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migrate_v8_adds_user_library_tables() {
+        let conn = in_memory_conn();
+        migrate(&conn).unwrap();
+        for table in [
+            "user_profile",
+            "user_playback_state",
+            "user_list",
+            "user_list_member",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "missing table {table}");
+        }
+    }
+
+    #[test]
+    fn migrate_v9_adds_user_media_preference_table() {
+        let conn = in_memory_conn();
+        migrate(&conn).unwrap();
+        assert!(table_exists(&conn, "user_media_preference").unwrap());
     }
 }

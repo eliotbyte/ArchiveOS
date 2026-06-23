@@ -88,6 +88,17 @@ pub fn delete_subscription(conn: &Connection, id: Uuid) -> Result<(), VaultError
     Ok(())
 }
 
+pub fn subscription_exists_for_url(conn: &Connection, url: &str) -> Result<bool, VaultError> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM source_subscription WHERE url = ?1",
+            [url],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    Ok(exists > 0)
+}
+
 pub fn due_subscriptions(conn: &Connection) -> Result<Vec<SourceSubscription>, VaultError> {
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn
@@ -181,6 +192,78 @@ pub fn subscription_job_input(sub: &SourceSubscription) -> Result<String, VaultE
     .to_json()
 }
 
+pub fn run_subscription_now(
+    conn: &Connection,
+    id: Uuid,
+    target_vault: &str,
+) -> Result<crate::jobs::Job, VaultError> {
+    let sub = get_subscription(conn, id)?.ok_or(VaultError::NotFound)?;
+    let input = subscription_job_input(&sub)?;
+    crate::jobs::create_job(conn, "yt-dlp", target_vault, &input)
+}
+
+#[derive(Debug, Clone)]
+pub struct EnrichedSubscription {
+    pub subscription: SourceSubscription,
+    pub collection_id: Option<Uuid>,
+    pub collection_title: Option<String>,
+}
+
+pub fn enrich_subscriptions(
+    conn: &Connection,
+    subs: Vec<SourceSubscription>,
+) -> Result<Vec<EnrichedSubscription>, VaultError> {
+    let mut out = Vec::with_capacity(subs.len());
+    for sub in subs {
+        let collection_id = sub
+            .options
+            .as_ref()
+            .and_then(|o| o.collection_entity_id.as_ref())
+            .and_then(|id| Uuid::parse_str(id).ok())
+            .or_else(|| {
+                crate::import::db::find_entity_id_by_source_url(conn, &sub.url)
+                    .ok()
+                    .flatten()
+            });
+        let collection_title = collection_id.and_then(|id| {
+            conn.query_row(
+                "SELECT title FROM collection WHERE id = ?1",
+                [id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        });
+        out.push(EnrichedSubscription {
+            subscription: sub,
+            collection_id,
+            collection_title,
+        });
+    }
+    Ok(out)
+}
+
+pub fn bind_subscription_collection(
+    conn: &Connection,
+    subscription_url: &str,
+    collection_entity_id: Uuid,
+) -> Result<(), VaultError> {
+    let mut subs = list_subscriptions(conn)?;
+    subs.retain(|s| s.url == subscription_url);
+    for sub in subs {
+        let mut options = sub.options.clone().unwrap_or_default();
+        options.collection_entity_id = Some(collection_entity_id.to_string());
+        let options_json = serde_json::to_string(&options).map_err(VaultError::from)?;
+        conn.execute(
+            "UPDATE source_subscription SET options_json = ?1 WHERE id = ?2",
+            params![options_json, sub.id.to_string()],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 fn db_err(err: rusqlite::Error) -> VaultError {
     VaultError::Database {
         detail: err.to_string(),
@@ -264,6 +347,7 @@ mod tests {
                         video: "best_1080p".into(),
                         ..Default::default()
                     },
+                    ..Default::default()
                 }),
             },
         )

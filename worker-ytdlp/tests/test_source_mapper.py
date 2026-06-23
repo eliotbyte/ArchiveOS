@@ -13,6 +13,11 @@ def test_extractor_from_youtube_info():
     assert extractor_from_info(info) == "youtube"
 
 
+def test_extractor_from_youtube_tab_info():
+    info = {"extractor_key": "YoutubeTab", "webpage_url": "https://youtube.com/playlist?list=PLx"}
+    assert extractor_from_info(info) == "youtube"
+
+
 def test_extractor_from_pornhub_info():
     info = {"extractor_key": "Pornhub", "webpage_url": "https://www.pornhub.com/view_video.php?viewkey=x"}
     assert extractor_from_info(info) == "pornhub"

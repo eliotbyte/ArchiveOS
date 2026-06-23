@@ -5,17 +5,18 @@ import { VideoPlayerProvider } from "../context/VideoPlayerContext";
 import YouTubeSectionPage from "./YouTubeSectionPage";
 
 const listEntities = vi.fn();
-const listCollections = vi.fn();
+const listLibraryLists = vi.fn();
 
 const mockApi = {
   listEntities,
-  listCollections,
+  listLibraryLists,
 };
 
 vi.mock("../context/VaultContext", () => ({
   useVaultApi: () => mockApi,
   useVault: () => ({
     assetContentUrl: (assetId: string) => `/assets/${assetId}`,
+    api: mockApi,
   }),
 }));
 
@@ -32,7 +33,7 @@ function renderPage() {
 describe("YouTubeSectionPage", () => {
   beforeEach(() => {
     listEntities.mockReset();
-    listCollections.mockReset();
+    listLibraryLists.mockReset();
     listEntities.mockResolvedValue([
       {
         id: "v1",
@@ -46,29 +47,37 @@ describe("YouTubeSectionPage", () => {
         primary_asset_status: "present",
       },
     ]);
-    listCollections.mockResolvedValue([
+    listLibraryLists.mockResolvedValue([
       {
-        id: "c1",
-        collection_type: "youtube_playlist",
+        id: "smart:recently_added",
+        list_kind: "smart",
+        list_type: "smart_recently_added",
+        title: "Recently Added",
+        member_count: 1,
+        overlay: true,
+        icon: "🕐",
+      },
+      {
+        id: "source:c1",
+        list_kind: "source",
+        list_type: "youtube_playlist",
         title: "Favorites",
         member_count: 2,
+        overlay: false,
       },
       {
-        id: "c2",
-        collection_type: "folder",
-        title: "Inbox folder",
-        member_count: 1,
-      },
-      {
-        id: "c3",
-        collection_type: "youtube_playlist",
-        title: "Empty playlist",
+        id: "user:wl",
+        list_kind: "user",
+        list_type: "watch_later",
+        title: "Watch Later",
         member_count: 0,
+        overlay: true,
+        icon: "⏰",
       },
     ]);
   });
 
-  it("requests youtube videos and youtube collections with nonempty filter", async () => {
+  it("requests youtube videos and library lists for the section", async () => {
     renderPage();
 
     await waitFor(() => {
@@ -76,15 +85,15 @@ describe("YouTubeSectionPage", () => {
         limit: 100,
         kind: "video",
         source: "youtube",
+        sort: "added_desc",
       });
-      expect(listCollections).toHaveBeenCalledWith({ min_member_count: 1 });
+      expect(listLibraryLists).toHaveBeenCalledWith({ section: "youtube" });
     });
 
+    expect(screen.getByRole("link", { name: /Recently Added/i })).toBeTruthy();
     expect(screen.getByRole("link", { name: /Favorites/i })).toBeTruthy();
-    expect(screen.queryByText("Inbox folder")).toBeNull();
-    expect(screen.queryByText("Empty playlist")).toBeNull();
+    expect(screen.getByRole("link", { name: /Watch Later/i })).toBeTruthy();
     expect(screen.getByText("Cool Video")).toBeTruthy();
     expect(screen.getByText("Test Channel")).toBeTruthy();
-    expect(screen.queryByText("youtube")).toBeNull();
   });
 });

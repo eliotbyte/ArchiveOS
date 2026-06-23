@@ -198,6 +198,40 @@ def test_error_kind_to_item_status_maps_lifecycle():
     assert error_kind_to_item_status("unknown") == "failed"
 
 
+def test_build_manifest_preserves_enriched_channel_avatar():
+    probe = {
+        "_type": "video",
+        "id": "abc123",
+        "title": "One",
+        "channel_id": "UC123",
+        "channel": "Test Channel",
+        "channel_url": "https://youtube.com/channel/UC123",
+    }
+    enriched_channel = {
+        "source": "youtube",
+        "kind": "channel",
+        "external_id": "UC123",
+        "url": "https://youtube.com/channel/UC123",
+        "metadata": {"title": "Test Channel"},
+        "avatar": {
+            "path": "files/UC123.jpg",
+            "source_url": "https://example.com/avatar.jpg",
+        },
+    }
+    manifest = build_manifest(
+        vault_name="archiveos",
+        input_url="https://youtube.com/watch?v=abc123",
+        probe=probe,
+        items=[],
+        channels=[enriched_channel],
+        relations=[],
+    )
+    assert len(manifest["channels"]) == 1
+    channel = manifest["channels"][0]
+    assert channel["avatar"]["path"] == "files/UC123.jpg"
+    assert channel["metadata"]["title"] == "Test Channel"
+
+
 def test_channel_from_info_and_relation():
     channel = channel_from_info(
         {

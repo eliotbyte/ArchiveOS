@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 
+use std::path::Path;
+
 use archiveos_contract::{EntityPreviewSummary, MetadataEntry, VaultError};
 use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::assets::{self, find_asset_by_preview_role};
+use crate::layout::find_blob_path;
 use crate::metadata;
 use crate::preview::{
     ROLE_PREVIEW_IMAGE_LARGE, ROLE_PREVIEW_IMAGE_SMALL, ROLE_TIMELINE_MANIFEST,
@@ -51,6 +54,14 @@ pub struct EntityDetail {
 }
 
 pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, VaultError> {
+    get_entity_at(conn, entity_id, None)
+}
+
+pub fn get_entity_at(
+    conn: &Connection,
+    entity_id: Uuid,
+    vault_root: Option<&Path>,
+) -> Result<EntityDetail, VaultError> {
     let row = conn
         .query_row(
             "SELECT id, content_hash, mime, size, status, added_at, created_at
@@ -92,7 +103,7 @@ pub fn get_entity(conn: &Connection, entity_id: Uuid) -> Result<EntityDetail, Va
     let metadata_entries = load_metadata_entries(conn, id)?;
     let metadata = metadata::flatten_metadata(&metadata_entries);
     let assets = crate::assets::list_assets_with_metadata(conn, id)?;
-    let preview = resolve_entity_preview(conn, id)?;
+    let preview = resolve_entity_preview_at(conn, id, vault_root)?;
     let timeline_sprite = resolve_timeline_sprite(conn, id)?;
     let timeline_manifest = resolve_timeline_manifest(conn, id)?;
 
@@ -118,27 +129,32 @@ pub fn resolve_entity_preview(
     conn: &Connection,
     entity_id: Uuid,
 ) -> Result<Option<EntityPreview>, VaultError> {
+    resolve_entity_preview_at(conn, entity_id, None)
+}
+
+pub fn resolve_entity_preview_at(
+    conn: &Connection,
+    entity_id: Uuid,
+    vault_root: Option<&Path>,
+) -> Result<Option<EntityPreview>, VaultError> {
     let is_video = is_video_entity(conn, entity_id)?;
 
     if is_video {
-        if let Some(preview) = resolve_source_thumbnail_preview(conn, entity_id)? {
+        if let Some(preview) = resolve_source_thumbnail_preview_at(conn, entity_id, vault_root)? {
             return Ok(Some(preview));
         }
     }
 
-    if let Some(preview) =
-        preview_from_role(conn, entity_id, ROLE_PREVIEW_IMAGE_SMALL)?
-    {
-        return Ok(Some(preview));
-    }
-    if let Some(preview) =
-        preview_from_role(conn, entity_id, ROLE_PREVIEW_IMAGE_LARGE)?
-    {
-        return Ok(Some(preview));
+    for role in [ROLE_PREVIEW_IMAGE_SMALL, ROLE_PREVIEW_IMAGE_LARGE] {
+        if let Some(preview) = preview_from_role(conn, entity_id, role)? {
+            if let Some(preview) = reconcile_preview(conn, vault_root, preview)? {
+                return Ok(Some(preview));
+            }
+        }
     }
 
     if !is_video {
-        resolve_source_thumbnail_preview(conn, entity_id)
+        resolve_source_thumbnail_preview_at(conn, entity_id, vault_root)
     } else {
         Ok(None)
     }
@@ -203,9 +219,54 @@ fn preview_from_role(
     }))
 }
 
-fn resolve_source_thumbnail_preview(
+fn reconcile_preview(
+    conn: &Connection,
+    vault_root: Option<&Path>,
+    preview: EntityPreview,
+) -> Result<Option<EntityPreview>, VaultError> {
+    if let Some(root) = vault_root {
+        if !managed_asset_blob_exists(conn, root, preview.asset_id)? {
+            let _ = assets::mark_asset_status(conn, preview.asset_id, "missing", None);
+            return Ok(None);
+        }
+    }
+    Ok(Some(preview))
+}
+
+fn managed_asset_blob_exists(
+    conn: &Connection,
+    vault_root: &Path,
+    asset_id: Uuid,
+) -> Result<bool, VaultError> {
+    let asset = assets::get_asset(conn, asset_id)?;
+    if asset.status != "present" {
+        return Ok(false);
+    }
+    match asset.storage_strategy.as_str() {
+        "managed" => {
+            let Some(hash) = asset.content_hash.as_deref() else {
+                return Ok(false);
+            };
+            Ok(find_blob_path(
+                vault_root,
+                hash,
+                asset.ext.as_deref(),
+                asset.mime.as_deref(),
+            )
+            .is_ok())
+        }
+        "reference" => Ok(asset
+            .path
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file())),
+        _ => Ok(true),
+    }
+}
+
+fn resolve_source_thumbnail_preview_at(
     conn: &Connection,
     entity_id: Uuid,
+    vault_root: Option<&Path>,
 ) -> Result<Option<EntityPreview>, VaultError> {
     let thumb_external_id: Option<String> = conn
         .query_row(
@@ -221,32 +282,37 @@ fn resolve_source_thumbnail_preview(
     let Some(external_id) = thumb_external_id else {
         if let Some(primary) = assets::find_primary_asset(conn, entity_id)? {
             if primary.kind == "image" && primary.status == "present" {
-                return Ok(Some(EntityPreview {
+                let preview = EntityPreview {
                     entity_id,
                     asset_id: primary.id,
                     kind: primary.kind,
                     preview_role: "primary_image".to_string(),
                     status: primary.status,
-                }));
+                };
+                return reconcile_preview(conn, vault_root, preview);
             }
         }
         return Ok(None);
     };
 
-    conn.query_row(
-        "SELECT ea.entity_id, ea.id, ea.kind, ea.status,
-                COALESCE(
-                    (SELECT value FROM entity_asset_metadata
-                     WHERE asset_id = ea.id AND key = 'preview_role' LIMIT 1),
-                    'source_thumbnail'
-                ) AS preview_role
-         FROM source_ref sr
-         JOIN entity_asset ea ON ea.entity_id = sr.entity_id
-         WHERE sr.external_id = ?1 AND sr.kind = 'thumbnail'
-           AND ea.kind = 'thumbnail' AND ea.status = 'present'
-         LIMIT 1",
-        [external_id],
-        |row| {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ea.entity_id, ea.id, ea.kind, ea.status,
+                    COALESCE(
+                        (SELECT value FROM entity_asset_metadata
+                         WHERE asset_id = ea.id AND key = 'preview_role' LIMIT 1),
+                        'source_thumbnail'
+                    ) AS preview_role
+             FROM source_ref sr
+             JOIN entity_asset ea ON ea.entity_id = sr.entity_id
+             WHERE sr.external_id = ?1 AND sr.kind = 'thumbnail'
+               AND ea.kind = 'thumbnail' AND ea.status = 'present'
+             ORDER BY ea.size DESC, ea.updated_at DESC",
+        )
+        .map_err(db_err)?;
+
+    let rows = stmt
+        .query_map([external_id], |row| {
             Ok(EntityPreview {
                 entity_id: Uuid::parse_str(&row.get::<_, String>(0)?).map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -266,10 +332,17 @@ fn resolve_source_thumbnail_preview(
                 status: row.get(3)?,
                 preview_role: row.get(4)?,
             })
-        },
-    )
-    .optional()
-    .map_err(db_err)
+        })
+        .map_err(db_err)?;
+
+    for row in rows {
+        let preview = row.map_err(db_err)?;
+        if let Some(preview) = reconcile_preview(conn, vault_root, preview)? {
+            return Ok(Some(preview));
+        }
+    }
+
+    Ok(None)
 }
 
 fn load_metadata_entries(
@@ -491,6 +564,94 @@ mod tests {
             .expect("preview");
         assert_eq!(preview.preview_role, "source_thumbnail");
         assert_eq!(preview.asset_id, thumb_asset_id);
+    }
+
+    #[test]
+    fn resolve_preview_prefers_largest_thumbnail_asset() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let video_id = Uuid::new_v4();
+        let thumb_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        insert_entity(
+            vault.connection(),
+            video_id,
+            None,
+            Some("video/mp4"),
+            0,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+        insert_entity(
+            vault.connection(),
+            thumb_id,
+            None,
+            Some("image/jpeg"),
+            1,
+            "present",
+            &now,
+            None,
+        )
+        .unwrap();
+        upsert_metadata(
+            vault.connection(),
+            video_id,
+            "thumbnail_external_id",
+            "vid:thumbnail",
+            "archiveos",
+        )
+        .unwrap();
+        crate::import::db::insert_source_ref(
+            vault.connection(),
+            Uuid::new_v4(),
+            thumb_id,
+            "youtube",
+            "thumbnail",
+            "vid:thumbnail",
+            None,
+            "live",
+        )
+        .unwrap();
+        let small_asset_id = crate::assets::upsert_asset(
+            vault.connection(),
+            &UpsertAssetInput {
+                entity_id: thumb_id,
+                role: "supporting",
+                kind: "thumbnail",
+                content_hash: Some("small"),
+                mime: Some("image/jpeg"),
+                size: 100,
+                ext: Some(".jpg"),
+                status: "present",
+                storage_strategy: "managed",
+                path: None,
+            },
+        )
+        .unwrap();
+        let _large_asset_id = crate::assets::upsert_asset(
+            vault.connection(),
+            &UpsertAssetInput {
+                entity_id: thumb_id,
+                role: "supporting",
+                kind: "thumbnail",
+                content_hash: Some("large"),
+                mime: Some("image/jpeg"),
+                size: 36_000,
+                ext: Some(".jpg"),
+                status: "present",
+                storage_strategy: "managed",
+                path: None,
+            },
+        )
+        .unwrap();
+
+        let preview = resolve_entity_preview(vault.connection(), video_id)
+            .unwrap()
+            .expect("preview");
+        assert_ne!(preview.asset_id, small_asset_id);
+        assert_eq!(preview.preview_role, "source_thumbnail");
     }
 
     #[test]

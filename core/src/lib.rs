@@ -1,6 +1,7 @@
 pub mod browse;
 pub mod cas;
 pub mod assets;
+pub mod channels;
 pub mod collections;
 pub mod db;
 pub mod entity;
@@ -9,14 +10,18 @@ pub mod import;
 pub mod inbox;
 pub mod jobs;
 pub mod layout;
+pub mod library_lists;
 pub mod media;
 pub mod metadata;
+pub mod playback;
 pub mod preview;
 pub mod registry;
 pub mod search;
 pub mod sources;
 pub mod subscriptions;
 pub mod tags;
+pub mod user_lists;
+pub mod user_preferences;
 pub mod vault;
 
 pub use cas::CasStoreResult;
@@ -25,5 +30,5 @@ pub use inbox::InboxReport;
 pub use registry::{open_vault_ref, Registry};
 pub use vault::{Vault, VaultCapability};
 
-pub use archiveos_contract::{BrowseQuery, EntityHit, EntityListItem, EntityPreviewSummary, MetadataEntry, SearchQuery};
+pub use archiveos_contract::{BrowseQuery, ChannelDetail, EntityHit, EntityListItem, EntityPreviewSummary, MetadataEntry, SearchQuery};
 pub use entity::EntityDetail;

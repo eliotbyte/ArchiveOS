@@ -40,9 +40,16 @@ describe("library sections registry", () => {
       kind: "image",
       query: "cat",
     });
+
+    const videos = getSectionById("videos")!;
+    expect(sectionBrowseParams(videos)).toEqual({
+      limit: 100,
+      kind: "video",
+      exclude_source: "youtube",
+    });
   });
 
-  it("filters excluded sources client-side", () => {
+  it("filters all ytdlp sources client-side", () => {
     const section = getSectionById("videos")!;
     const items: EntityListItem[] = [
       {
@@ -55,13 +62,19 @@ describe("library sections registry", () => {
         id: "2",
         status: "present",
         tags: [],
+        source: "vimeo",
+      },
+      {
+        id: "3",
+        status: "present",
+        tags: [],
         source: "inbox",
       },
     ];
 
     const filtered = filterSectionItems(items, section);
     expect(filtered).toHaveLength(1);
-    expect(filtered[0]?.id).toBe("2");
+    expect(filtered[0]?.id).toBe("3");
   });
 
   it("recognizes youtube collection types", () => {

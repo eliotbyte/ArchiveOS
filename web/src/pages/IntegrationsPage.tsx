@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import IntegrationIcon from "../components/IntegrationIcon";
 
 export default function IntegrationsPage() {
   return (
@@ -13,10 +14,13 @@ export default function IntegrationsPage() {
 
       <div className="integration-grid">
         <Link className="integration-card" to="/integrations/ytdlp">
-          <h3>yt-dlp</h3>
-          <p className="card-meta">
-            Archive or monitor URLs from supported video platforms.
-          </p>
+          <IntegrationIcon integration="ytdlp" size="lg" />
+          <div className="integration-card-body">
+            <h3>yt-dlp</h3>
+            <p className="card-meta">
+              Archive or monitor URLs from supported video platforms.
+            </p>
+          </div>
         </Link>
       </div>
     </section>

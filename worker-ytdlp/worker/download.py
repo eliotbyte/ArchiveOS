@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from .progress import parse_download_percent
 from .validation import expected_best_height
 
 
@@ -34,6 +35,7 @@ def download_video(
     *,
     format_selector: str | None = "bv*+ba/b",
     extra_args: list[str] | None = None,
+    on_progress: Callable[[float], None] | None = None,
 ) -> tuple[Path | None, dict[str, Any] | None, str | None]:
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -57,10 +59,32 @@ def download_video(
         "--write-info-json",
         "--no-overwrites",
         "--no-warnings",
+        "--newline",
         *(extra_args or []),
         page_url,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    stderr_lines: list[str] = []
+    returncode = 0
+    if on_progress:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            stderr_lines.append(line)
+            percent = parse_download_percent(line)
+            if percent is not None:
+                on_progress(percent)
+        returncode = process.wait()
+    else:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        returncode = result.returncode
+        stderr_lines = (result.stderr or "").splitlines(keepends=True)
 
     info_path = output_dir / f"{video_id}.info.json"
     if info_path.exists():
@@ -71,8 +95,9 @@ def download_video(
         for path in output_dir.glob(f"{video_id}.*")
         if path.suffix.lower() not in {".json", ".part", ".ytdl"}
     ]
-    if result.returncode != 0 and not video_files:
-        return None, info, result.stderr.strip() or "download failed"
+    if returncode != 0 and not video_files:
+        stderr = "".join(stderr_lines).strip() or "download failed"
+        return None, info, stderr
     if not video_files:
         return None, info, "download produced no file"
 

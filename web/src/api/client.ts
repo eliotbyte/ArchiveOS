@@ -52,6 +52,46 @@ export interface AssetPolicy {
   audio_languages?: string[];
 }
 
+export interface UserMediaPreferences {
+  subtitle_languages: string[];
+  subtitle_mode: string;
+  audio_languages: string[];
+  audio_mode: string;
+  video_quality: string;
+  thumbnail: boolean;
+  automatic_subtitles: boolean;
+}
+
+export function preferencesToAssetPolicy(
+  prefs: UserMediaPreferences,
+): AssetPolicy {
+  const video =
+    prefs.video_quality === "1080" || prefs.video_quality === "720"
+      ? prefs.video_quality
+      : prefs.video_quality === "best_1080p"
+        ? "best_1080p"
+        : "best";
+  return {
+    video,
+    thumbnail: prefs.thumbnail,
+    subtitles: prefs.subtitle_mode,
+    subtitle_languages: prefs.subtitle_languages,
+    automatic_subtitles: prefs.automatic_subtitles,
+    audio_tracks: prefs.audio_mode,
+    audio_languages: prefs.audio_languages,
+  };
+}
+
+export const DEFAULT_MEDIA_PREFERENCES: UserMediaPreferences = {
+  subtitle_languages: ["ru", "en", "original"],
+  subtitle_mode: "preferred",
+  audio_languages: ["original", "ru", "en"],
+  audio_mode: "preferred",
+  video_quality: "best",
+  thumbnail: true,
+  automatic_subtitles: true,
+};
+
 export interface ArchiveRequest {
   url: string;
   mode?: "once" | "subscription";
@@ -96,6 +136,72 @@ export function createApi(vaultName: string) {
     getEntity: (id: string) =>
       request<EntityDetail>(`/vaults/${vaultName}/entities/${id}`),
 
+    deleteEntity: (id: string) =>
+      request<{ entity_id: string; status: string }>(
+        `/vaults/${vaultName}/entities/${id}`,
+        { method: "DELETE" },
+      ),
+
+    removeCollectionMember: (collectionId: string, entityId: string) =>
+      request<{
+        collection_id: string;
+        entity_id: string;
+        status: string;
+      }>(
+        `/vaults/${vaultName}/collections/${collectionId}/members/${entityId}`,
+        { method: "DELETE" },
+      ),
+
+    refreshEntityFromSource: (
+      entityId: string,
+      options: { metadata_only?: boolean } = {},
+    ) =>
+      request<Job>(
+        `/vaults/${vaultName}/entities/${entityId}/refresh-from-source`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            metadata_only: options.metadata_only ?? false,
+          }),
+        },
+      ),
+
+    refreshCollectionFromSource: (collectionId: string) =>
+      request<Job>(
+        `/vaults/${vaultName}/collections/${collectionId}/refresh-from-source`,
+        { method: "POST" },
+      ),
+
+    getMediaPreferences: () =>
+      request<UserMediaPreferences>(
+        `/vaults/${vaultName}/users/me/media-preferences`,
+      ),
+
+    setMediaPreferences: (prefs: UserMediaPreferences) =>
+      request<UserMediaPreferences>(
+        `/vaults/${vaultName}/users/me/media-preferences`,
+        {
+          method: "PUT",
+          body: JSON.stringify(prefs),
+        },
+      ),
+
+    getChannel: (channelId: string) =>
+      request<ChannelDetail>(`/vaults/${vaultName}/channels/${channelId}`),
+
+    listChannelVideos: (
+      channelId: string,
+      params: { limit?: number; sort?: string } = {},
+    ) => {
+      const query = new URLSearchParams();
+      if (params.limit !== undefined) query.set("limit", String(params.limit));
+      if (params.sort) query.set("sort", params.sort);
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return request<EntityListItem[]>(
+        `/vaults/${vaultName}/channels/${channelId}/videos${suffix}`,
+      );
+    },
+
     searchEntities: (query: string) =>
       request<EntityHit[]>(
         `/vaults/${vaultName}/search?${new URLSearchParams({ query }).toString()}`,
@@ -128,20 +234,134 @@ export function createApi(vaultName: string) {
         `/vaults/${vaultName}/collections/${collectionId}/members`,
       ),
 
+    listLibraryLists: (
+      params: {
+        section?: string;
+        source?: string;
+        kind?: string;
+      } = {},
+    ) => {
+      const query = new URLSearchParams();
+      if (params.section) query.set("section", params.section);
+      if (params.source) query.set("source", params.source);
+      if (params.kind) query.set("kind", params.kind);
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return request<LibraryListSummary[]>(
+        `/vaults/${vaultName}/library/lists${suffix}`,
+      );
+    },
+
+    getLibraryList: (
+      listId: string,
+      params: { sort?: string; section?: string; source?: string; kind?: string } = {},
+    ) => {
+      const query = new URLSearchParams();
+      if (params.sort) query.set("sort", params.sort);
+      if (params.section) query.set("section", params.section);
+      if (params.source) query.set("source", params.source);
+      if (params.kind) query.set("kind", params.kind);
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return request<LibraryListDetail>(
+        `/vaults/${vaultName}/library/lists/${encodeURIComponent(listId)}${suffix}`,
+      );
+    },
+
+    getPlaybackState: (entityId: string) =>
+      request<PlaybackStateResponse>(
+        `/vaults/${vaultName}/playback-state/${entityId}`,
+      ),
+
+    upsertPlaybackState: (
+      entityId: string,
+      body: PlaybackStateInput,
+    ) =>
+      request<PlaybackStateResponse>(
+        `/vaults/${vaultName}/playback-state/${entityId}`,
+        {
+          method: "PUT",
+          body: JSON.stringify(body),
+        },
+      ),
+
+    dismissPlaybackState: (entityId: string) =>
+      request<{ entity_id: string; status: string }>(
+        `/vaults/${vaultName}/playback-state/${entityId}/dismiss`,
+        { method: "POST" },
+      ),
+
+    createUserList: (body: CreateUserListInput) =>
+      request<{ id: string }>(`/vaults/${vaultName}/user-lists`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      }),
+
+    addUserListMember: (listId: string, entityId: string) =>
+      request<{ list_id: string; entity_id: string; status: string }>(
+        `/vaults/${vaultName}/user-lists/${listId}/members`,
+        {
+          method: "POST",
+          body: JSON.stringify({ entity_id: entityId }),
+        },
+      ),
+
+    removeUserListMember: (listId: string, entityId: string) =>
+      request<{ list_id: string; entity_id: string; status: string }>(
+        `/vaults/${vaultName}/user-lists/${listId}/members/${entityId}`,
+        { method: "DELETE" },
+      ),
+
+    reorderUserListMembers: (listId: string, entityIds: string[]) =>
+      request<{ list_id: string; status: string }>(
+        `/vaults/${vaultName}/user-lists/${listId}/members/reorder`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ entity_ids: entityIds }),
+        },
+      ),
+
+    addToWatchLater: async (entityId: string) => {
+      const lists = await request<LibraryListSummary[]>(
+        `/vaults/${vaultName}/library/lists?section=youtube`,
+      );
+      const watchLater = lists.find((list) => list.list_type === "watch_later");
+      if (!watchLater?.id.startsWith("user:")) {
+        throw new Error("Watch Later list not found");
+      }
+      const listId = watchLater.id.slice("user:".length);
+      return request<{ list_id: string; entity_id: string; status: string }>(
+        `/vaults/${vaultName}/user-lists/${listId}/members`,
+        {
+          method: "POST",
+          body: JSON.stringify({ entity_id: entityId }),
+        },
+      );
+    },
+
     listJobs: (params: {
       status?: string;
       type?: string;
       limit?: number;
+      root_only?: boolean;
     } = {}) => {
       const query = new URLSearchParams();
       if (params.status) query.set("status", params.status);
       if (params.type) query.set("type", params.type);
+      if (params.root_only) query.set("root_only", "true");
       query.set("limit", String(params.limit ?? 100));
       return request<Job[]>(`/vaults/${vaultName}/jobs?${query.toString()}`);
     },
 
-    getJob: (jobId: string) =>
-      request<Job>(`/vaults/${vaultName}/jobs/${jobId}`),
+    getJob: (jobId: string, params: { include_children?: boolean } = {}) => {
+      const query = new URLSearchParams();
+      if (params.include_children) query.set("include_children", "true");
+      const suffix = query.size > 0 ? `?${query.toString()}` : "";
+      return request<JobDetail>(`/vaults/${vaultName}/jobs/${jobId}${suffix}`);
+    },
+
+    cancelJob: (jobId: string) =>
+      request<Job>(`/vaults/${vaultName}/jobs/${jobId}/cancel`, {
+        method: "POST",
+      }),
 
     retryJob: (jobId: string) =>
       request<Job>(`/vaults/${vaultName}/jobs/${jobId}/retry`, {
@@ -154,6 +374,11 @@ export function createApi(vaultName: string) {
     deleteSubscription: (id: string) =>
       request<{ removed: string }>(`/vaults/${vaultName}/subscriptions/${id}`, {
         method: "DELETE",
+      }),
+
+    runSubscription: (id: string) =>
+      request<Job>(`/vaults/${vaultName}/subscriptions/${id}/run`, {
+        method: "POST",
       }),
 
     listSourceFailures: (params: { source?: string; kind?: string } = {}) => {
@@ -172,15 +397,7 @@ export function createApi(vaultName: string) {
         body: JSON.stringify({
           url: body.url,
           mode: body.mode ?? "once",
-          asset_policy: {
-            video: "best",
-            thumbnail: true,
-            subtitles: "preferred",
-            subtitle_languages: ["original", "en", "ru"],
-            automatic_subtitles: true,
-            audio_tracks: "main",
-            ...body.asset_policy,
-          },
+          asset_policy: body.asset_policy,
         }),
       }),
 
@@ -192,15 +409,7 @@ export function createApi(vaultName: string) {
           kind: "playlist",
           url: body.url,
           interval_minutes: body.interval_minutes,
-          asset_policy: {
-            video: "best",
-            thumbnail: true,
-            subtitles: "preferred",
-            subtitle_languages: ["original", "en", "ru"],
-            automatic_subtitles: true,
-            audio_tracks: "main",
-            ...body.asset_policy,
-          },
+          asset_policy: body.asset_policy,
         }),
       }),
 
@@ -254,8 +463,21 @@ export interface EntityListItem {
   primary_asset_id?: string | null;
   primary_asset_status?: string | null;
   channel?: string | null;
+  channel_entity_id?: string | null;
+  channel_avatar_preview?: EntityPreviewSummary | null;
   uploader?: string | null;
   duration?: string | null;
+}
+
+export interface ChannelDetail {
+  id: string;
+  title?: string | null;
+  description?: string | null;
+  follower_count?: string | null;
+  verified?: boolean | null;
+  source?: string | null;
+  url?: string | null;
+  avatar_preview?: EntityPreviewSummary | null;
 }
 
 export interface CollectionSummary {
@@ -290,9 +512,76 @@ export interface CollectionMemberItem {
   primary_asset_status?: string | null;
   duration?: string | null;
   channel?: string | null;
+  channel_entity_id?: string | null;
+  channel_avatar_preview?: EntityPreviewSummary | null;
   uploader?: string | null;
   webpage_url?: string | null;
+  playback_position?: number | null;
+  playback_progress?: number | null;
 }
+
+export type LibraryListKind = "smart" | "user" | "source";
+
+export interface LibraryListSummary {
+  id: string;
+  list_kind: LibraryListKind;
+  list_type: string;
+  title: string;
+  member_count: number;
+  cover_preview?: EntityPreviewSummary | null;
+  icon?: string | null;
+  overlay: boolean;
+}
+
+export interface LibraryListDetail {
+  id: string;
+  list_kind: LibraryListKind;
+  list_type: string;
+  title: string;
+  member_count: number;
+  cover_preview?: EntityPreviewSummary | null;
+  icon?: string | null;
+  overlay: boolean;
+  members: CollectionMemberItem[];
+  sort_options: string[];
+  default_sort: string;
+  can_reorder: boolean;
+}
+
+export interface PlaybackStateInput {
+  asset_id: string;
+  position_seconds: number;
+  duration_seconds?: number | null;
+}
+
+export interface PlaybackStateResponse {
+  entity_id: string;
+  asset_id: string;
+  position_seconds: number;
+  duration_seconds?: number | null;
+  completed_at?: string | null;
+  updated_at: string;
+}
+
+export interface CreateUserListInput {
+  title: string;
+  list_type?: string;
+}
+
+export type BrowseSort =
+  | "added_desc"
+  | "published_desc"
+  | "views_desc"
+  | "manual"
+  | "updated_desc";
+
+export const BROWSE_SORT_LABELS: Record<BrowseSort, string> = {
+  added_desc: "Date added",
+  published_desc: "Publish date",
+  views_desc: "View count",
+  manual: "Manual order",
+  updated_desc: "Recently updated",
+};
 
 export interface EntityHit {
   id: string;
@@ -329,6 +618,22 @@ export interface EntityDetail {
   timeline_manifest?: EntityPreviewSummary | null;
 }
 
+export interface JobProgressStep {
+  id: string;
+  label: string;
+  status: string;
+  percent?: number | null;
+}
+
+export interface JobProgress {
+  phase: string;
+  current?: number | null;
+  total?: number | null;
+  label?: string | null;
+  percent?: number | null;
+  steps?: JobProgressStep[];
+}
+
 export interface Job {
   id: string;
   type: string;
@@ -338,6 +643,12 @@ export interface Job {
   created_at: string;
   lease_until?: string | null;
   target_vault?: string;
+  progress?: JobProgress | null;
+  parent_job_id?: string | null;
+}
+
+export interface JobDetail extends Job {
+  children?: Job[];
 }
 
 export interface Subscription {
@@ -351,6 +662,8 @@ export interface Subscription {
   last_checked_at?: string | null;
   status: string;
   created_at: string;
+  collection_id?: string | null;
+  collection_title?: string | null;
 }
 
 export interface PreviewBackfillReport {

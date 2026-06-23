@@ -1,4 +1,5 @@
 mod asset_reconcile_scheduler;
+mod blob_gc_scheduler;
 mod error;
 mod inbox_watcher;
 mod media;
@@ -66,6 +67,13 @@ async fn main() {
             .expect("ARCHIVEOS_DEFAULT_VAULT required when asset reconcile scheduler enabled");
         asset_reconcile_scheduler::spawn(config_dir.clone(), vault_name);
         tracing::info!("asset reconcile scheduler started");
+    }
+
+    if blob_gc_scheduler::enabled() {
+        let vault_name = std::env::var("ARCHIVEOS_DEFAULT_VAULT")
+            .expect("ARCHIVEOS_DEFAULT_VAULT required when blob gc scheduler enabled");
+        blob_gc_scheduler::spawn(config_dir.clone(), vault_name);
+        tracing::info!("blob gc scheduler started");
     }
 
     if preview_backfill::enabled() {

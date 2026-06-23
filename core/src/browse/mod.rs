@@ -1,8 +1,11 @@
-use archiveos_contract::{BrowseQuery, EntityListItem, EntityPreviewSummary, VaultError};
+use std::path::Path;
+
+use archiveos_contract::{BrowseQuery, BrowseSort, EntityListItem, EntityPreviewSummary, VaultError};
 use rusqlite::{params_from_iter, Connection, Row, ToSql};
 use uuid::Uuid;
 
-use crate::entity::resolve_entity_preview;
+use crate::channels::enrich_entity_list_items;
+use crate::entity::resolve_entity_preview_at;
 use crate::entity::{resolve_timeline_manifest, resolve_timeline_sprite};
 use crate::metadata;
 use crate::tags;
@@ -11,8 +14,38 @@ const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 200;
 
 pub fn browse(conn: &Connection, query: &BrowseQuery) -> Result<Vec<EntityListItem>, VaultError> {
+    browse_at(conn, None, query)
+}
+
+pub fn browse_at(
+    conn: &Connection,
+    vault_root: Option<&Path>,
+    query: &BrowseQuery,
+) -> Result<Vec<EntityListItem>, VaultError> {
+    let sort = query
+        .sort
+        .as_deref()
+        .and_then(BrowseSort::parse)
+        .unwrap_or(BrowseSort::AddedDesc);
+    browse_sorted_at(conn, vault_root, query, sort)
+}
+
+pub fn browse_sorted(
+    conn: &Connection,
+    query: &BrowseQuery,
+    sort: BrowseSort,
+) -> Result<Vec<EntityListItem>, VaultError> {
+    browse_sorted_at(conn, None, query, sort)
+}
+
+pub fn browse_sorted_at(
+    conn: &Connection,
+    vault_root: Option<&Path>,
+    query: &BrowseQuery,
+    sort: BrowseSort,
+) -> Result<Vec<EntityListItem>, VaultError> {
     let limit = normalize_limit(query.limit);
-    let (sql, bind_values) = build_browse_sql(query, limit);
+    let (sql, bind_values) = build_browse_sql(query, limit, sort);
     let mut stmt = conn.prepare(&sql).map_err(db_err)?;
     let mut rows = stmt
         .query_map(params_from_iter(bind_values.iter()), map_row)
@@ -22,7 +55,7 @@ pub fn browse(conn: &Connection, query: &BrowseQuery) -> Result<Vec<EntityListIt
     for row in rows.by_ref() {
         let mut item = row.map_err(db_err)?;
         item.tags = tags::list_entity_tags(conn, item.id)?;
-        item.preview = resolve_entity_preview(conn, item.id)?
+        item.preview = resolve_entity_preview_at(conn, item.id, vault_root)?
             .map(EntityPreviewSummary::from);
         item.timeline_sprite = resolve_timeline_sprite(conn, item.id)?
             .map(EntityPreviewSummary::from);
@@ -31,7 +64,87 @@ pub fn browse(conn: &Connection, query: &BrowseQuery) -> Result<Vec<EntityListIt
         items.push(item);
     }
 
+    enrich_entity_list_items(conn, &mut items)?;
+
     Ok(items)
+}
+
+pub fn browse_entity_ids_sorted(
+    conn: &Connection,
+    entity_ids: &[Uuid],
+    sort: BrowseSort,
+) -> Result<Vec<Uuid>, VaultError> {
+    if entity_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if sort == BrowseSort::Manual {
+        return Ok(entity_ids.to_vec());
+    }
+
+    let placeholders: Vec<String> = entity_ids.iter().map(|_| "?".into()).collect();
+    let order_clause = sort_order_sql(sort);
+    let title_order = metadata::title_precedence_sql();
+
+    let sql = format!(
+        "SELECT e.id FROM entity e
+         WHERE e.id IN ({}) AND e.status != 'user_deleted'
+         ORDER BY {}",
+        placeholders.join(", "),
+        order_clause.replace("{title_order}", &title_order),
+    );
+
+    let bind_values: Vec<Box<dyn ToSql>> = entity_ids
+        .iter()
+        .map(|id| Box::new(id.to_string()) as Box<dyn ToSql>)
+        .collect();
+
+    let mut stmt = conn.prepare(&sql).map_err(db_err)?;
+    let rows = stmt
+        .query_map(params_from_iter(bind_values.iter()), |row| {
+            let id: String = row.get(0)?;
+            Ok(id)
+        })
+        .map_err(db_err)?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        let id = row.map_err(db_err)?;
+        items.push(Uuid::parse_str(&id).map_err(|e| VaultError::Database {
+            detail: e.to_string(),
+        })?);
+    }
+    Ok(items)
+}
+
+fn sort_order_sql(sort: BrowseSort) -> String {
+    let title_order = "{title_order}";
+    match sort {
+        BrowseSort::AddedDesc => "e.added_at DESC".into(),
+        BrowseSort::PublishedDesc => format!(
+            "COALESCE(
+                (SELECT m.value FROM metadata m WHERE m.entity_id = e.id AND m.key = 'upload_date' ORDER BY {title_order} LIMIT 1),
+                e.created_at,
+                e.added_at
+            ) DESC"
+        ),
+        BrowseSort::ViewsDesc => format!(
+            "CAST(COALESCE(
+                (SELECT m.value FROM metadata m WHERE m.entity_id = e.id AND m.key = 'view_count' ORDER BY {title_order} LIMIT 1),
+                '0'
+            ) AS INTEGER) DESC"
+        ),
+        BrowseSort::Manual => "e.added_at DESC".into(),
+    }
+}
+
+fn youtube_source_exists_sql(entity_alias: &str) -> String {
+    format!(
+        "EXISTS (
+            SELECT 1 FROM source_ref sr
+            WHERE sr.entity_id = {entity_alias}.id
+              AND (sr.source = 'youtube' OR sr.source LIKE 'youtube%')
+        )"
+    )
 }
 
 fn normalize_limit(limit: u32) -> i64 {
@@ -39,7 +152,7 @@ fn normalize_limit(limit: u32) -> i64 {
     i64::from(limit.min(MAX_LIMIT))
 }
 
-fn build_browse_sql(query: &BrowseQuery, limit: i64) -> (String, Vec<Box<dyn ToSql>>) {
+fn build_browse_sql(query: &BrowseQuery, limit: i64, sort: BrowseSort) -> (String, Vec<Box<dyn ToSql>>) {
     let hidden = if query.include_hidden {
         String::new()
     } else {
@@ -81,14 +194,44 @@ fn build_browse_sql(query: &BrowseQuery, limit: i64) -> (String, Vec<Box<dyn ToS
         bind_values.push(Box::new(kind.clone()));
     }
     if let Some(source) = &query.source {
+        if source == "youtube" {
+            filters.push(youtube_source_exists_sql("e"));
+        } else {
+            filters.push(
+                "EXISTS (
+                    SELECT 1 FROM source_ref sr
+                    WHERE sr.entity_id = e.id AND sr.source = ?
+                )"
+                .into(),
+            );
+            bind_values.push(Box::new(source.clone()));
+        }
+    }
+    if let Some(exclude_source) = &query.exclude_source {
+        if exclude_source == "youtube" {
+            filters.push(format!("NOT {}", youtube_source_exists_sql("e")));
+        } else {
+            filters.push(
+                "NOT EXISTS (
+                    SELECT 1 FROM source_ref sr
+                    WHERE sr.entity_id = e.id AND sr.source = ?
+                )"
+                .into(),
+            );
+            bind_values.push(Box::new(exclude_source.clone()));
+        }
+    }
+    if let Some(uploaded_by) = query.uploaded_by {
         filters.push(
             "EXISTS (
-                SELECT 1 FROM source_ref sr
-                WHERE sr.entity_id = e.id AND sr.source = ?
+                SELECT 1 FROM entity_relation er
+                WHERE er.from_entity_id = e.id
+                  AND er.relation = 'uploaded_by'
+                  AND er.to_entity_id = ?
             )"
             .into(),
         );
-        bind_values.push(Box::new(source.clone()));
+        bind_values.push(Box::new(uploaded_by.to_string()));
     }
     if let Some(status) = &query.status {
         filters.push("e.status = ?".into());
@@ -96,6 +239,8 @@ fn build_browse_sql(query: &BrowseQuery, limit: i64) -> (String, Vec<Box<dyn ToS
     }
 
     bind_values.push(Box::new(limit));
+
+    let order_clause = sort_order_sql(sort);
 
     let sql = format!(
         "SELECT e.id, e.mime, e.status,
@@ -148,9 +293,10 @@ fn build_browse_sql(query: &BrowseQuery, limit: i64) -> (String, Vec<Box<dyn ToS
                 ) AS duration
          FROM entity e
          WHERE {filters}{hidden}
-         ORDER BY e.added_at DESC
+         ORDER BY {order_clause}
          LIMIT ?",
         filters = filters.join(" AND "),
+        order_clause = order_clause.replace("{title_order}", &title_order),
     );
 
     (sql, bind_values)
@@ -194,6 +340,8 @@ fn map_row(row: &Row<'_>) -> rusqlite::Result<EntityListItem> {
         timeline_sprite: None,
         timeline_manifest: None,
         channel,
+        channel_entity_id: None,
+        channel_avatar_preview: None,
         uploader,
         duration,
     })

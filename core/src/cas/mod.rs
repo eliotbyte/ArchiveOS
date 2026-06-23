@@ -7,6 +7,11 @@ use sha2::{Digest, Sha256};
 
 use crate::layout::blob_path;
 
+pub mod gc;
+pub mod refcount;
+
+pub use gc::{remove_blob_if_unreferenced, sweep_unreferenced_blobs, BlobGcOptions};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CasStoreResult {
     pub content_hash: String,

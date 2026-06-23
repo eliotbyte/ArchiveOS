@@ -184,8 +184,14 @@ impl Vault {
         &self,
         target_vault: &str,
         entity_id: Uuid,
+        parent_job_id: Option<Uuid>,
     ) -> Result<Option<crate::jobs::Job>, VaultError> {
-        crate::preview::maybe_enqueue_preview_job(self.connection(), target_vault, entity_id)
+        crate::preview::maybe_enqueue_preview_job(
+            self.connection(),
+            target_vault,
+            entity_id,
+            parent_job_id,
+        )
     }
 
     pub fn backfill_preview_jobs(
@@ -229,14 +235,89 @@ impl Vault {
         &self,
         collection_id: Uuid,
     ) -> Result<crate::collections::CollectionDetail, VaultError> {
-        crate::collections::get_collection(self.connection(), collection_id)
+        crate::collections::get_collection(self.connection(), Some(&self.root), collection_id)
     }
 
     pub fn list_collection_members(
         &self,
         collection_id: Uuid,
     ) -> Result<Vec<crate::collections::CollectionMemberItem>, VaultError> {
-        crate::collections::list_collection_members(self.connection(), collection_id)
+        crate::collections::list_collection_members(self.connection(), Some(&self.root), collection_id)
+    }
+
+    pub fn list_library_lists(
+        &self,
+        query: &archiveos_contract::LibraryListQuery,
+    ) -> Result<Vec<archiveos_contract::LibraryListSummary>, VaultError> {
+        crate::library_lists::list_library_lists(self.connection(), query)
+    }
+
+    pub fn get_library_list(
+        &self,
+        list_id: &str,
+        sort: Option<&str>,
+        scope: Option<&archiveos_contract::LibraryListQuery>,
+    ) -> Result<archiveos_contract::LibraryListDetail, VaultError> {
+        crate::library_lists::get_library_list(self.connection(), Some(&self.root), list_id, sort, scope)
+    }
+
+    pub fn upsert_playback_state(
+        &self,
+        entity_id: Uuid,
+        input: &archiveos_contract::PlaybackStateInput,
+    ) -> Result<archiveos_contract::PlaybackStateResponse, VaultError> {
+        let user_id = crate::playback::ensure_default_user(self.connection())?;
+        crate::playback::upsert_playback_state(self.connection(), user_id, entity_id, input)
+    }
+
+    pub fn get_playback_state(
+        &self,
+        entity_id: Uuid,
+    ) -> Result<Option<archiveos_contract::PlaybackStateResponse>, VaultError> {
+        let user_id = crate::playback::ensure_default_user(self.connection())?;
+        crate::playback::get_playback_state(self.connection(), user_id, entity_id)
+    }
+
+    pub fn dismiss_playback_state(&self, entity_id: Uuid) -> Result<(), VaultError> {
+        let user_id = crate::playback::ensure_default_user(self.connection())?;
+        crate::playback::dismiss_playback_state(self.connection(), user_id, entity_id)
+    }
+
+    pub fn create_user_list(
+        &self,
+        input: &archiveos_contract::CreateUserListInput,
+    ) -> Result<Uuid, VaultError> {
+        let user_id = crate::playback::ensure_default_user(self.connection())?;
+        crate::user_lists::create_user_list(self.connection(), user_id, input)
+    }
+
+    pub fn add_user_list_member(
+        &self,
+        list_id: Uuid,
+        input: &archiveos_contract::AddUserListMemberInput,
+    ) -> Result<(), VaultError> {
+        crate::user_lists::add_user_list_member(self.connection(), list_id, input)
+    }
+
+    pub fn remove_user_list_member(
+        &self,
+        list_id: Uuid,
+        entity_id: Uuid,
+    ) -> Result<(), VaultError> {
+        crate::user_lists::remove_user_list_member(self.connection(), list_id, entity_id)
+    }
+
+    pub fn reorder_user_list_members(
+        &self,
+        list_id: Uuid,
+        entity_ids: &[Uuid],
+    ) -> Result<(), VaultError> {
+        crate::user_lists::reorder_user_list_members(self.connection(), list_id, entity_ids)
+    }
+
+    pub fn ensure_watch_later_list(&self) -> Result<Uuid, VaultError> {
+        let user_id = crate::playback::ensure_default_user(self.connection())?;
+        crate::user_lists::ensure_watch_later_list(self.connection(), user_id)
     }
 
     pub fn vault_capabilities(&self) -> Vec<VaultCapability> {
@@ -274,7 +355,37 @@ impl Vault {
         &self,
         query: &archiveos_contract::BrowseQuery,
     ) -> Result<Vec<archiveos_contract::EntityListItem>, VaultError> {
-        crate::browse::browse(self.connection(), query)
+        crate::browse::browse_at(self.connection(), Some(&self.root), query)
+    }
+
+    pub fn get_channel(
+        &self,
+        channel_entity_id: uuid::Uuid,
+    ) -> Result<archiveos_contract::ChannelDetail, VaultError> {
+        crate::channels::get_channel_detail(self.connection(), channel_entity_id)
+    }
+
+    pub fn list_channel_videos(
+        &self,
+        channel_entity_id: uuid::Uuid,
+        limit: u32,
+        sort: Option<&str>,
+    ) -> Result<Vec<archiveos_contract::EntityListItem>, VaultError> {
+        let _ = crate::channels::get_channel_detail(self.connection(), channel_entity_id)?;
+        let sort = sort
+            .and_then(archiveos_contract::BrowseSort::parse)
+            .unwrap_or(archiveos_contract::BrowseSort::PublishedDesc);
+        crate::browse::browse_sorted_at(
+            self.connection(),
+            Some(&self.root),
+            &archiveos_contract::BrowseQuery {
+                uploaded_by: Some(channel_entity_id),
+                limit,
+                sort: Some(sort.as_str().to_string()),
+                ..Default::default()
+            },
+            sort,
+        )
     }
 
     pub fn resolve_asset_content_path(
@@ -342,11 +453,29 @@ impl Vault {
     }
 
     pub fn get_entity(&self, entity_id: Uuid) -> Result<crate::entity::EntityDetail, VaultError> {
-        crate::entity::get_entity(self.connection(), entity_id)
+        crate::entity::get_entity_at(self.connection(), entity_id, Some(&self.root))
     }
 
     pub fn create_job(&self, job_type: &str, target_vault: &str, input: &str) -> Result<crate::jobs::Job, VaultError> {
         crate::jobs::create_job(self.connection(), job_type, target_vault, input)
+    }
+
+    pub fn create_job_with_parent(
+        &self,
+        job_type: &str,
+        target_vault: &str,
+        input: &str,
+        parent_job_id: Option<Uuid>,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        crate::jobs::create_job_with_options(
+            self.connection(),
+            crate::jobs::CreateJobOptions {
+                job_type,
+                target_vault,
+                input,
+                parent_job_id,
+            },
+        )
     }
 
     pub fn claim_job(
@@ -357,8 +486,17 @@ impl Vault {
         crate::jobs::claim_job(self.connection(), lease_secs, job_type)
     }
 
-    pub fn heartbeat_job(&self, job_id: Uuid, lease_secs: i64) -> Result<(), VaultError> {
-        crate::jobs::heartbeat_job(self.connection(), job_id, lease_secs)
+    pub fn heartbeat_job(
+        &self,
+        job_id: Uuid,
+        lease_secs: i64,
+        progress: Option<&archiveos_contract::JobProgress>,
+    ) -> Result<bool, VaultError> {
+        crate::jobs::heartbeat_job(self.connection(), job_id, lease_secs, progress)
+    }
+
+    pub fn cancel_job(&self, job_id: Uuid) -> Result<crate::jobs::Job, VaultError> {
+        crate::jobs::cancel_job(self.connection(), job_id)
     }
 
     pub fn finish_job(&self, job_id: Uuid, status: &str) -> Result<(), VaultError> {
@@ -374,6 +512,10 @@ impl Vault {
         filter: crate::jobs::JobListFilter<'_>,
     ) -> Result<Vec<crate::jobs::Job>, VaultError> {
         crate::jobs::list_jobs(self.connection(), filter)
+    }
+
+    pub fn list_child_jobs(&self, parent_id: Uuid) -> Result<Vec<crate::jobs::Job>, VaultError> {
+        crate::jobs::list_child_jobs(self.connection(), parent_id)
     }
 
     pub fn retry_job(&self, job_id: Uuid) -> Result<crate::jobs::Job, VaultError> {
@@ -425,14 +567,95 @@ impl Vault {
     }
 
     pub fn delete_subscription(&self, id: Uuid) -> Result<(), VaultError> {
-        crate::subscriptions::delete_subscription(self.connection(), id)
+        let sub = crate::subscriptions::get_subscription(self.connection(), id)?
+            .ok_or(VaultError::NotFound)?;
+        let url = sub.url.clone();
+        crate::subscriptions::delete_subscription(self.connection(), id)?;
+        crate::jobs::cancel_jobs_for_source_url(self.connection(), &url)?;
+        Ok(())
+    }
+
+    pub fn run_subscription_now(
+        &self,
+        id: Uuid,
+        target_vault: &str,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        crate::subscriptions::run_subscription_now(self.connection(), id, target_vault)
+    }
+
+    pub fn list_enriched_subscriptions(
+        &self,
+    ) -> Result<Vec<crate::subscriptions::EnrichedSubscription>, VaultError> {
+        let subs = crate::subscriptions::list_subscriptions(self.connection())?;
+        crate::subscriptions::enrich_subscriptions(self.connection(), subs)
+    }
+
+    pub fn get_media_preferences(&self) -> Result<archiveos_contract::UserMediaPreferences, VaultError> {
+        crate::user_preferences::get_media_preferences(self.connection())
+    }
+
+    pub fn set_media_preferences(
+        &self,
+        prefs: &archiveos_contract::UserMediaPreferences,
+    ) -> Result<archiveos_contract::UserMediaPreferences, VaultError> {
+        crate::user_preferences::set_media_preferences(self.connection(), prefs)
+    }
+
+    pub fn refresh_entity_from_source(
+        &self,
+        target_vault: &str,
+        entity_id: Uuid,
+        metadata_only: bool,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        let conn = self.connection();
+        let url = crate::import::db::primary_source_url(conn, entity_id)?
+            .ok_or(VaultError::NotFound)?;
+        let prefs = crate::user_preferences::get_media_preferences(conn)?;
+        let asset_policy = if metadata_only {
+            let mut policy = archiveos_contract::UserMediaPreferences::metadata_only_policy();
+            policy.subtitle_languages = prefs.subtitle_languages;
+            policy.subtitles = prefs.subtitle_mode;
+            policy.automatic_subtitles = prefs.automatic_subtitles;
+            policy
+        } else {
+            prefs.to_asset_policy()
+        };
+        self.create_archive_job(
+            target_vault,
+            YtdlpJobInput {
+                url,
+                mode: "once".into(),
+                resync: true,
+                removed_items: "mark_removed".into(),
+                asset_policy,
+            },
+        )
+    }
+
+    pub fn refresh_collection_from_source(
+        &self,
+        target_vault: &str,
+        collection_id: Uuid,
+    ) -> Result<crate::jobs::Job, VaultError> {
+        let conn = self.connection();
+        let url = crate::import::db::primary_source_url(conn, collection_id)?
+            .ok_or(VaultError::NotFound)?;
+        let prefs = crate::user_preferences::get_media_preferences(conn)?;
+        self.create_archive_job(
+            target_vault,
+            YtdlpJobInput {
+                url,
+                mode: "once".into(),
+                resync: true,
+                removed_items: "mark_removed".into(),
+                asset_policy: prefs.to_asset_policy(),
+            },
+        )
     }
 
     pub fn delete_entity(&self, entity_id: Uuid) -> Result<(), VaultError> {
+        let urls = crate::import::db::source_ref_urls_for_entity(self.connection(), entity_id)?;
         let assets = crate::assets::list_assets(self.connection(), entity_id)?;
-        for asset in &assets {
-            remove_asset_file(asset)?;
-        }
         let changed = self
             .connection()
             .execute(
@@ -443,19 +666,26 @@ impl Vault {
         if changed == 0 {
             return Err(VaultError::NotFound);
         }
-        crate::assets::mark_entity_assets_deleted(self.connection(), entity_id)
+        crate::assets::mark_entity_assets_deleted(self.connection(), entity_id)?;
+        for asset in &assets {
+            release_asset_storage(self.connection(), &self.root, asset)?;
+        }
+        for url in urls {
+            crate::jobs::cancel_jobs_for_source_url(self.connection(), &url)?;
+        }
+        Ok(())
     }
 
     pub fn delete_asset(&self, asset_id: Uuid) -> Result<(), VaultError> {
         let asset = crate::assets::get_asset(self.connection(), asset_id)?;
-        remove_asset_file(&asset)?;
         let now = Utc::now().to_rfc3339();
         crate::assets::mark_asset_status(
             self.connection(),
             asset_id,
             "deleted_by_user",
             Some(&now),
-        )
+        )?;
+        release_asset_storage(self.connection(), &self.root, &asset)
     }
 
     pub fn remove_collection_member(
@@ -505,13 +735,31 @@ impl Vault {
 
         let mut changed = 0;
         for asset in assets {
-            if asset_path_exists(&asset) {
+            if asset.storage_strategy == "remote" {
+                continue;
+            }
+            if asset_storage_exists(&self.root, &asset) {
                 continue;
             }
             crate::assets::mark_asset_status(self.connection(), asset.id, "missing_local", None)?;
             changed += 1;
         }
         Ok(changed)
+    }
+
+    pub fn reconcile_blobs(
+        &self,
+        dry_run: bool,
+        min_age_secs: u64,
+    ) -> Result<archiveos_contract::BlobGcReport, VaultError> {
+        crate::cas::sweep_unreferenced_blobs(
+            self.connection(),
+            &self.root,
+            crate::cas::BlobGcOptions {
+                dry_run,
+                min_age_secs,
+            },
+        )
     }
 
     pub fn create_asset_acquisition_job(
@@ -597,7 +845,31 @@ impl Vault {
     }
 }
 
-fn remove_asset_file(asset: &crate::assets::EntityAsset) -> Result<(), VaultError> {
+fn release_asset_storage(
+    conn: &Connection,
+    vault_root: &Path,
+    asset: &crate::assets::EntityAsset,
+) -> Result<(), VaultError> {
+    match asset.storage_strategy.as_str() {
+        "managed" => {
+            let Some(hash) = asset.content_hash.as_deref() else {
+                return Ok(());
+            };
+            let _ = crate::cas::remove_blob_if_unreferenced(
+                conn,
+                vault_root,
+                hash,
+                asset.ext.as_deref(),
+                asset.mime.as_deref(),
+            )?;
+            Ok(())
+        }
+        "reference" => remove_reference_asset_file(asset),
+        _ => Ok(()),
+    }
+}
+
+fn remove_reference_asset_file(asset: &crate::assets::EntityAsset) -> Result<(), VaultError> {
     let Some(path) = &asset.path else {
         return Ok(());
     };
@@ -608,12 +880,28 @@ fn remove_asset_file(asset: &crate::assets::EntityAsset) -> Result<(), VaultErro
     Ok(())
 }
 
-fn asset_path_exists(asset: &crate::assets::EntityAsset) -> bool {
-    asset
-        .path
-        .as_deref()
-        .map(|path| Path::new(path).is_file())
-        .unwrap_or(false)
+fn asset_storage_exists(vault_root: &Path, asset: &crate::assets::EntityAsset) -> bool {
+    match asset.storage_strategy.as_str() {
+        "managed" => asset
+            .content_hash
+            .as_deref()
+            .and_then(|hash| {
+                find_blob_path(
+                    vault_root,
+                    hash,
+                    asset.ext.as_deref(),
+                    asset.mime.as_deref(),
+                )
+                .ok()
+            })
+            .is_some_and(|path| path.is_file()),
+        "reference" => asset
+            .path
+            .as_deref()
+            .map(|path| Path::new(path).is_file())
+            .unwrap_or(false),
+        _ => true,
+    }
 }
 
 fn resolve_staging_file(staging_dir: PathBuf, relative_path: &str) -> Result<PathBuf, VaultError> {
@@ -909,5 +1197,103 @@ mod tests {
             .query_row("SELECT status FROM entity_asset LIMIT 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(status, "missing_local");
+    }
+
+    #[test]
+    fn reconcile_managed_asset_uses_content_hash() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let hash = "9".repeat(64);
+        let blob = crate::layout::blob_path(vault.root(), &hash, ".jpg").unwrap();
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"thumb").unwrap();
+
+        let entity_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        crate::import::db::insert_entity(
+            vault.connection(),
+            entity_id,
+            None,
+            Some("image/jpeg"),
+            5,
+            "active",
+            &now,
+            None,
+        )
+        .unwrap();
+        crate::assets::upsert_asset(
+            vault.connection(),
+            &crate::assets::UpsertAssetInput {
+                entity_id,
+                role: "supporting",
+                kind: "thumbnail",
+                content_hash: Some(&hash),
+                mime: Some("image/jpeg"),
+                size: 5,
+                ext: Some(".jpg"),
+                status: "present",
+                storage_strategy: "managed",
+                path: Some(&blob.to_string_lossy()),
+            },
+        )
+        .unwrap();
+
+        std::fs::remove_file(&blob).unwrap();
+        let changed = vault.reconcile_assets().unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    #[test]
+    fn delete_asset_keeps_shared_managed_blob_for_other_entity() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let hash = "8".repeat(64);
+        let blob = crate::layout::blob_path(vault.root(), &hash, ".jpg").unwrap();
+        std::fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        std::fs::write(&blob, b"shared").unwrap();
+        let now = Utc::now().to_rfc3339();
+        let entity_a = Uuid::new_v4();
+        let entity_b = Uuid::new_v4();
+        crate::import::db::insert_entity(
+            vault.connection(),
+            entity_a,
+            Some(&hash),
+            Some("image/jpeg"),
+            6,
+            "active",
+            &now,
+            None,
+        )
+        .unwrap();
+        crate::import::db::insert_entity(
+            vault.connection(),
+            entity_b,
+            None,
+            Some("image/jpeg"),
+            6,
+            "active",
+            &now,
+            None,
+        )
+        .unwrap();
+        let asset_b = crate::assets::upsert_asset(
+            vault.connection(),
+            &crate::assets::UpsertAssetInput {
+                entity_id: entity_b,
+                role: "supporting",
+                kind: "thumbnail",
+                content_hash: Some(&hash),
+                mime: Some("image/jpeg"),
+                size: 6,
+                ext: Some(".jpg"),
+                status: "present",
+                storage_strategy: "managed",
+                path: Some(&blob.to_string_lossy()),
+            },
+        )
+        .unwrap();
+
+        vault.delete_asset(asset_b).unwrap();
+        assert!(blob.exists());
     }
 }

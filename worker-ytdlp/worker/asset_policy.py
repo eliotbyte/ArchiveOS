@@ -9,6 +9,7 @@ from typing import Any
 class AssetPolicy:
     video: str = "best"
     thumbnail: bool = True
+    channel_avatar: bool = True
     subtitles: str = "preferred"
     subtitle_languages: list[str] = field(
         default_factory=lambda: ["original", "en", "ru"]
@@ -24,6 +25,7 @@ class AssetPolicy:
         return cls(
             video=str(raw.get("video") or "best"),
             thumbnail=bool(raw.get("thumbnail", True)),
+            channel_avatar=bool(raw.get("channel_avatar", True)),
             subtitles=str(raw.get("subtitles") or "preferred"),
             subtitle_languages=list(raw.get("subtitle_languages") or ["original", "en", "ru"]),
             automatic_subtitles=bool(raw.get("automatic_subtitles", True)),
@@ -69,8 +71,16 @@ def should_download_video(policy: AssetPolicy) -> bool:
     return policy.video != "none"
 
 
+def is_metadata_only_refresh(policy: AssetPolicy) -> bool:
+    return policy.video == "none"
+
+
 def should_download_thumbnail(policy: AssetPolicy) -> bool:
     return policy.thumbnail
+
+
+def should_download_channel_avatar(policy: AssetPolicy) -> bool:
+    return policy.channel_avatar
 
 
 def _language_matches(requested: str, candidate: str, info_language: str | None) -> bool:

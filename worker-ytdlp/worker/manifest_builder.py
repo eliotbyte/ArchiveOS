@@ -315,7 +315,12 @@ def build_manifest(
         if channel.get("external_id")
     }
     if channel := channel_from_probe(probe, resolved_source):
-        channels_by_id[channel["external_id"]] = channel
+        external_id = channel["external_id"]
+        existing = channels_by_id.get(external_id)
+        if existing:
+            channels_by_id[external_id] = {**channel, **existing}
+        else:
+            channels_by_id[external_id] = channel
     manifest: dict[str, Any] = {
         "source": "yt-dlp",
         "source_identity": resolved_source,

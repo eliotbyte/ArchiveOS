@@ -9,14 +9,17 @@ from pathlib import Path
 
 from .channels import channel_from_info, uploaded_by_relation
 from .config import Config
-from .core_client import CoreClient
+from .core_client import CoreClient, JobCancelled
 from .discovery import discover, require_entries
 from .download import DownloadError, download_video, probe_video
 from .asset_policy import (
+    is_metadata_only_refresh,
+    should_download_channel_avatar,
     should_download_thumbnail,
     should_download_video,
     video_format_selector,
 )
+from .channel_avatars import resolve_author_probe_url, try_channel_avatar
 from .job_input import parse_job_input
 from .ytdlp_args import cookies_args
 from .failures import classify_error, error_kind_to_item_status
@@ -24,6 +27,7 @@ from .manifest_builder import (
     build_item,
     build_manifest,
     build_thumbnail_item,
+    channel_from_probe,
     relative_staging_path,
     thumbnail_relation,
     with_thumbnail_metadata,
@@ -39,6 +43,12 @@ from .thumbnails import (
     best_thumbnail_url,
     download_thumbnail,
     thumbnail_external_id,
+)
+from .progress import (
+    ProgressReporter,
+    build_progress,
+    build_video_steps,
+    video_labels_from_probe,
 )
 from .updater import YtdlpUpdater, heartbeat_loop, update_ytdlp, ytdlp_version
 from .validation import ValidationError, validate_download
@@ -86,6 +96,8 @@ class Worker:
                     self.process_asset_job(job)
                 else:
                     self.process_job(job)
+            except JobCancelled:
+                logger.info("job %s cancelled", job.get("id"))
             except Exception as err:
                 logger.exception("job %s failed", job.get("id"))
                 if job.get("type") == "yt-dlp-asset":
@@ -116,9 +128,11 @@ class Worker:
         files_dir.mkdir(parents=True, exist_ok=True)
 
         stop = threading.Event()
+        cancelled = threading.Event()
 
         def send_heartbeat() -> None:
-            self.client.heartbeat(job_id, self.config.job_lease_secs)
+            if self.client.heartbeat(job_id, self.config.job_lease_secs):
+                cancelled.set()
 
         heartbeat_thread = threading.Thread(
             target=heartbeat_loop,
@@ -132,7 +146,12 @@ class Worker:
         )
         heartbeat_thread.start()
 
+        def check_cancelled() -> None:
+            if cancelled.is_set():
+                raise JobCancelled()
+
         try:
+            check_cancelled()
             entity = self.client.get_entity(entity_id)
             assets = entity.get("assets") or []
             selected_asset: dict | None = None
@@ -151,6 +170,9 @@ class Worker:
             logger.info("asset job %s finished: %s", job_id, result)
         except TrackDownloadError as err:
             self.record_asset_failure(job, selected_asset, str(err))
+            raise
+        except JobCancelled:
+            self.client.finish_job(job_id, status="cancelled")
             raise
         finally:
             stop.set()
@@ -206,9 +228,20 @@ class Worker:
         files_dir.mkdir(parents=True, exist_ok=True)
 
         stop = threading.Event()
+        cancelled = threading.Event()
+
+        def send_progress(progress: dict | None) -> None:
+            if self.client.heartbeat(
+                job_id,
+                self.config.job_lease_secs,
+                progress=progress,
+            ):
+                cancelled.set()
+
+        progress_reporter = ProgressReporter(send_progress)
 
         def send_heartbeat() -> None:
-            self.client.heartbeat(job_id, self.config.job_lease_secs)
+            progress_reporter.tick()
 
         heartbeat_thread = threading.Thread(
             target=heartbeat_loop,
@@ -222,7 +255,16 @@ class Worker:
         )
         heartbeat_thread.start()
 
+        def check_cancelled() -> None:
+            if cancelled.is_set():
+                raise JobCancelled()
+
         try:
+            check_cancelled()
+            progress_reporter.update(
+                build_progress(phase="discovering", label=input_url),
+                force=True,
+            )
             probe = discover(
                 input_url,
                 playlist_max_items=self.config.ytdlp_playlist_max_items,
@@ -230,7 +272,11 @@ class Worker:
             )
             source = extractor_from_probe(probe)
             video_ids = require_entries(probe)
+            labels = video_labels_from_probe(probe)
+            playlist_label = probe.get("title") or input_url
             video_states = self.client.source_states(video_ids, source=source, kind="video")
+            thumb_ids = [thumbnail_external_id(video_id) for video_id in video_ids]
+            thumb_states = self.client.source_states(thumb_ids, source=source, kind="thumbnail")
             missing = []
             if should_download_video(policy):
                 missing = [
@@ -238,17 +284,44 @@ class Worker:
                     for video_id in video_ids
                     if should_download(video_states.get(video_id))
                 ]
-            thumb_ids = [thumbnail_external_id(video_id) for video_id in video_ids]
-            thumbs_present = self.client.sources_has(thumb_ids, source=source, kind="thumbnail")
             missing_thumbs = []
             if should_download_thumbnail(policy):
-                missing_thumbs = [
-                    video_id
-                    for video_id in video_ids
-                    if video_states.get(video_id, {}).get("known")
-                    and video_states.get(video_id, {}).get("has_present_asset")
-                    and not thumbs_present.get(thumbnail_external_id(video_id))
-                ]
+                if is_metadata_only_refresh(policy):
+                    missing_thumbs = list(video_ids)
+                else:
+                    missing_thumbs = [
+                        video_id
+                        for video_id in video_ids
+                        if not thumb_states.get(
+                            thumbnail_external_id(video_id), {}
+                        ).get("has_present_asset")
+                    ]
+
+            channels: dict[str, dict] = {}
+            relations: list[dict] = []
+            avatar_download_failures = 0
+            if is_metadata_only_refresh(policy):
+                channel = channel_from_probe(probe, source)
+                if channel:
+                    channel = self.enrich_channel(
+                        job_id=job_id,
+                        channel=channel,
+                        info=probe,
+                        files_dir=files_dir,
+                        policy=policy,
+                        extra_args=ytdlp_extra,
+                    )
+                    channels[channel["external_id"]] = channel
+                    if should_download_channel_avatar(policy) and not channel.get("avatar"):
+                        avatar_download_failures += 1
+                    for video_id in video_ids:
+                        relations.append(
+                            uploaded_by_relation(
+                                video_id,
+                                channel["external_id"],
+                                source,
+                            )
+                        )
 
             logger.info(
                 "job %s entries=%d missing_videos=%d missing_thumbs=%d",
@@ -259,11 +332,51 @@ class Worker:
             )
 
             items: list[dict] = []
-            channels: dict[str, dict] = {}
-            relations: list[dict] = []
+            done_ids: set[str] = set()
+            failed_ids: set[str] = set()
+            thumb_download_failures = 0
 
             for index, video_id in enumerate(missing, start=1):
+                check_cancelled()
                 logger.info("job %s acquiring %d/%d %s", job_id, index, len(missing), video_id)
+                label = labels.get(video_id, video_id)
+                progress_reporter.update(
+                    build_progress(
+                        phase="downloading",
+                        current=index,
+                        total=len(missing) or None,
+                        label=label,
+                        steps=build_video_steps(
+                            missing,
+                            labels,
+                            running_id=video_id,
+                            done_ids=done_ids,
+                            failed_ids=failed_ids,
+                        ),
+                    ),
+                    force=True,
+                )
+
+                def on_download_percent(percent: float, *, vid: str = video_id) -> None:
+                    check_cancelled()
+                    progress_reporter.update(
+                        build_progress(
+                            phase="downloading",
+                            current=index,
+                            total=len(missing) or None,
+                            label=labels.get(vid, vid),
+                            percent=percent,
+                            steps=build_video_steps(
+                                missing,
+                                labels,
+                                running_id=vid,
+                                running_percent=percent,
+                                done_ids=done_ids,
+                                failed_ids=failed_ids,
+                            ),
+                        )
+                    )
+
                 acquired_items, channel, acquired_relations = self.acquire_video(
                     job_id=job_id,
                     video_id=video_id,
@@ -271,9 +384,23 @@ class Worker:
                     source=source,
                     policy=policy,
                     extra_args=ytdlp_extra,
+                    on_progress=on_download_percent,
                 )
+                item_status = (
+                    acquired_items[0].get("status") if acquired_items else "failed"
+                )
+                if item_status == "complete":
+                    done_ids.add(video_id)
+                elif item_status not in {"discovered"}:
+                    failed_ids.add(video_id)
                 items.extend(acquired_items)
                 if channel:
+                    existing = channels.get(channel["external_id"])
+                    if existing:
+                        if existing.get("avatar") and not channel.get("avatar"):
+                            channel = {**channel, "avatar": existing["avatar"]}
+                        else:
+                            channel = {**existing, **channel}
                     channels[channel["external_id"]] = channel
                 relations.extend(acquired_relations)
 
@@ -285,6 +412,15 @@ class Worker:
                     len(missing_thumbs),
                     video_id,
                 )
+                progress_reporter.update(
+                    build_progress(
+                        phase="thumbnails",
+                        current=index,
+                        total=len(missing_thumbs) or None,
+                        label=labels.get(video_id, video_id),
+                    ),
+                    force=True,
+                )
                 thumb_items, acquired_relations = self.acquire_thumbnail_only(
                     job_id=job_id,
                     video_id=video_id,
@@ -293,9 +429,15 @@ class Worker:
                     extra_args=ytdlp_extra,
                     policy=policy,
                 )
+                if not thumb_items:
+                    thumb_download_failures += 1
                 items.extend(thumb_items)
                 relations.extend(acquired_relations)
 
+            progress_reporter.update(
+                build_progress(phase="importing", label=playlist_label),
+                force=True,
+            )
             manifest = build_manifest(
                 vault_name=self.config.vault_name,
                 input_url=input_url,
@@ -307,8 +449,23 @@ class Worker:
                 asset_policy=policy,
             )
             status = self.resolve_status(items)
+            if thumb_download_failures > 0 and not any(
+                item.get("status") == "complete"
+                and (item.get("source_ref") or {}).get("kind") == "thumbnail"
+                for item in items
+            ):
+                status = "failed" if status == "done" else status
+            elif thumb_download_failures > 0:
+                status = "partial"
+            if avatar_download_failures > 0 and status == "done":
+                status = "partial"
             result = self.client.submit_manifest(job_id, manifest, status=status)
             logger.info("job %s finished: %s", job_id, result)
+        except JobCancelled:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            self.client.finish_job(job_id, status="cancelled")
+            raise
         finally:
             stop.set()
             heartbeat_thread.join(timeout=2)
@@ -322,6 +479,7 @@ class Worker:
         source: str,
         policy,
         extra_args: list[str],
+        on_progress=None,
     ) -> tuple[list[dict], dict | None, list[dict]]:
         url = f"https://www.youtube.com/watch?v={video_id}" if source == "youtube" else None
         relations: list[dict] = []
@@ -332,6 +490,7 @@ class Worker:
                 files_dir,
                 format_selector=video_format_selector(policy),
                 extra_args=extra_args,
+                on_progress=on_progress,
             )
             if error:
                 error_kind, _ = classify_error(error)
@@ -345,6 +504,16 @@ class Worker:
                     message=error,
                     source=source,
                 )
+                channel = channel_from_info(info) if info else None
+                if channel and info:
+                    channel = self.enrich_channel(
+                        job_id=job_id,
+                        channel=channel,
+                        info=info,
+                        files_dir=files_dir,
+                        policy=policy,
+                        extra_args=extra_args,
+                    )
                 return (
                     [
                         build_item(
@@ -356,13 +525,23 @@ class Worker:
                             asset_policy=policy,
                         )
                     ],
-                    channel_from_info(info) if info else None,
+                    channel,
                     relations,
                 )
 
             if file_path is None:
                 assert info is not None
                 url = video_url_from_info(info, video_id) or url
+                channel = channel_from_info(info)
+                if channel:
+                    channel = self.enrich_channel(
+                        job_id=job_id,
+                        channel=channel,
+                        info=info,
+                        files_dir=files_dir,
+                        policy=policy,
+                        extra_args=extra_args,
+                    )
                 return (
                     [
                         build_item(
@@ -374,7 +553,7 @@ class Worker:
                             asset_policy=policy,
                         )
                     ],
-                    channel_from_info(info),
+                    channel,
                     relations,
                 )
 
@@ -386,6 +565,14 @@ class Worker:
             if channel:
                 relations.append(
                     uploaded_by_relation(video_id, channel["external_id"], channel["source"])
+                )
+                channel = self.enrich_channel(
+                    job_id=job_id,
+                    channel=channel,
+                    info=info,
+                    files_dir=files_dir,
+                    policy=policy,
+                    extra_args=extra_args,
                 )
 
             items = [
@@ -520,6 +707,40 @@ class Worker:
             source_thumbnail_url=source_url or "",
             source=source,
         )
+
+    def enrich_channel(
+        self,
+        *,
+        job_id: str,
+        channel: dict,
+        info: dict | None,
+        files_dir: Path,
+        policy,
+        extra_args: list[str],
+    ) -> dict:
+        if not should_download_channel_avatar(policy) or channel.get("avatar"):
+            return channel
+        author_url = channel.get("url") or resolve_author_probe_url(info or {})
+        if not author_url:
+            return channel
+        avatar = try_channel_avatar(
+            channel,
+            info or {},
+            files_dir,
+            extra_args=extra_args,
+        )
+        if avatar:
+            return {**channel, "avatar": avatar}
+        self.record_failure(
+            job_id=job_id,
+            kind="avatar",
+            external_id=channel["external_id"],
+            url=author_url,
+            stage="download",
+            message="channel avatar unavailable",
+            source=channel.get("source", "youtube"),
+        )
+        return channel
 
     def record_failure(
         self,
