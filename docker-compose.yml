@@ -5,6 +5,7 @@ services:
       args:
         VITE_VAULT_NAME: default
         VITE_API_BASE: ""
+    restart: unless-stopped
     ports:
       - "8080:8080"
     volumes:
