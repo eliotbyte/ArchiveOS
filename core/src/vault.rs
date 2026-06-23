@@ -176,6 +176,25 @@ impl Vault {
         crate::import::import(self, staging_dir, manifest, strategy)
     }
 
+    pub fn import_chunk(
+        &self,
+        staging_dir: &Path,
+        manifest: &ImportManifest,
+        strategy: ImportStrategy,
+        finalize: bool,
+    ) -> Result<ImportReport, VaultError> {
+        crate::import::import_with_options(
+            self,
+            staging_dir,
+            Some(manifest),
+            strategy,
+            crate::import::ImportOptions {
+                cleanup_staging: finalize,
+                finalize_membership: finalize,
+            },
+        )
+    }
+
     pub fn process_inbox(&self, target_vault: Option<&str>) -> Result<crate::inbox::InboxReport, VaultError> {
         crate::inbox::process_inbox(self, target_vault)
     }
@@ -503,6 +522,18 @@ impl Vault {
         crate::jobs::finish_job(self.connection(), job_id, status)
     }
 
+    pub fn delete_job(&self, job_id: Uuid) -> Result<(), VaultError> {
+        crate::jobs::delete_job(self.connection(), job_id)
+    }
+
+    pub fn update_job_progress(
+        &self,
+        job_id: Uuid,
+        progress: &archiveos_contract::JobProgress,
+    ) -> Result<(), VaultError> {
+        crate::jobs::update_job_progress(self.connection(), job_id, progress)
+    }
+
     pub fn get_job(&self, job_id: Uuid) -> Result<Option<crate::jobs::Job>, VaultError> {
         crate::jobs::get_job(self.connection(), job_id)
     }
@@ -553,6 +584,17 @@ impl Vault {
         kind: Option<&str>,
     ) -> Result<Vec<crate::failures::SourceFailure>, VaultError> {
         crate::failures::list_failures(self.connection(), source, kind)
+    }
+
+    pub fn list_failures_for_job(
+        &self,
+        job_id: Uuid,
+    ) -> Result<Vec<crate::failures::SourceFailure>, VaultError> {
+        crate::failures::list_failures_for_job(self.connection(), job_id)
+    }
+
+    pub fn delete_source_failure(&self, id: Uuid) -> Result<(), VaultError> {
+        crate::failures::delete_failure(self.connection(), id)
     }
 
     pub fn create_subscription(

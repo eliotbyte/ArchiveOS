@@ -56,7 +56,10 @@ pub fn router() -> Router<Arc<AppState>> {
             delete(remove_tag),
         )
         .route("/vaults/{vault}/jobs", get(list_jobs).post(create_job))
-        .route("/vaults/{vault}/jobs/{id}", get(get_job))
+        .route(
+            "/vaults/{vault}/jobs/{id}",
+            get(get_job).delete(delete_job),
+        )
         .route("/vaults/{vault}/jobs/{id}/retry", post(retry_job))
         .route("/vaults/{vault}/jobs/{id}/cancel", post(cancel_job))
         .route("/vaults/{vault}/archive", post(create_archive))
@@ -64,9 +67,14 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/vaults/{vault}/jobs/claim", post(claim_job))
         .route("/vaults/{vault}/jobs/{id}/heartbeat", post(heartbeat_job))
         .route("/vaults/{vault}/jobs/{id}/manifest", post(submit_manifest))
+        .route("/vaults/{vault}/jobs/{id}/import-chunk", post(import_chunk))
         .route("/vaults/{vault}/jobs/{id}/finish", post(finish_job))
         .route("/vaults/{vault}/sources/has", get(sources_has))
         .route("/vaults/{vault}/source-failures", get(list_source_failures).post(record_source_failure))
+        .route(
+            "/vaults/{vault}/source-failures/{id}",
+            delete(delete_source_failure),
+        )
         .route("/vaults/{vault}/subscriptions", get(list_subscriptions).post(create_subscription))
         .route("/vaults/{vault}/subscriptions/{id}", delete(delete_subscription))
         .route("/vaults/{vault}/subscriptions/{id}/run", post(run_subscription))
@@ -638,6 +646,8 @@ struct JobDetailResponse {
     job: JobResponse,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     children: Vec<JobResponse>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    failures: Vec<SourceFailureResponse>,
 }
 
 async fn get_job(
@@ -656,10 +666,25 @@ async fn get_job(
     } else {
         Vec::new()
     };
+    let failures = vault
+        .list_failures_for_job(job_id)?
+        .into_iter()
+        .map(SourceFailureResponse::from)
+        .collect();
     Ok(Json(JobDetailResponse {
         job: JobResponse::from(job),
         children,
+        failures,
     }))
+}
+
+async fn delete_job(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.delete_job(job_id)?;
+    Ok(Json(serde_json::json!({ "job_id": job_id, "deleted": true })))
 }
 
 async fn retry_job(
@@ -769,26 +794,167 @@ struct SubmitManifestRequest {
     status: Option<String>,
 }
 
+fn import_err_retryable(err: &archiveos_contract::VaultError) -> bool {
+    matches!(
+        err,
+        archiveos_contract::VaultError::InvalidLayout { detail }
+            if detail.contains("import file not found")
+    )
+}
+
+fn import_manifest_with_retry(
+    vault: &Vault,
+    staging: &std::path::Path,
+    manifest: &ImportManifest,
+    job_id: Uuid,
+    vault_name: &str,
+) -> Result<archiveos_contract::ImportReport, ApiError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<archiveos_contract::VaultError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match vault.import(staging, Some(manifest), ImportStrategy::Managed) {
+            Ok(report) => return Ok(report),
+            Err(err) => {
+                let retryable = import_err_retryable(&err);
+                if retryable && attempt + 1 < MAX_ATTEMPTS {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        vault = %vault_name,
+                        attempt = attempt + 1,
+                        error = %err,
+                        "manifest import retrying after missing staging file"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        300 * 2u64.saturating_pow(attempt),
+                    ));
+                    last_err = Some(err);
+                    continue;
+                }
+                tracing::warn!(
+                    job_id = %job_id,
+                    vault = %vault_name,
+                    error = %err,
+                    "manifest import failed"
+                );
+                return Err(err.into());
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or(archiveos_contract::VaultError::InvalidLayout {
+            detail: "manifest import failed".into(),
+        })
+        .into())
+}
+
 fn resolve_job_status(manifest: &ImportManifest, explicit: Option<&str>) -> String {
-    if let Some(status) = explicit {
-        return match status {
-            "done" | "partial" | "failed" => status.to_string(),
-            _ => "done".to_string(),
-        };
+    archiveos_core::jobs::resolve_manifest_job_status(manifest, explicit)
+}
+
+fn import_chunk_with_retry(
+    vault: &Vault,
+    staging: &std::path::Path,
+    manifest: &ImportManifest,
+    finalize: bool,
+    job_id: Uuid,
+    vault_name: &str,
+) -> Result<archiveos_contract::ImportReport, ApiError> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<archiveos_contract::VaultError> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match vault.import_chunk(staging, manifest, ImportStrategy::Managed, finalize) {
+            Ok(report) => return Ok(report),
+            Err(err) => {
+                let retryable = import_err_retryable(&err);
+                if retryable && attempt + 1 < MAX_ATTEMPTS {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        vault = %vault_name,
+                        attempt = attempt + 1,
+                        error = %err,
+                        "import chunk retrying after missing staging file"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        300 * 2u64.saturating_pow(attempt),
+                    ));
+                    last_err = Some(err);
+                    continue;
+                }
+                tracing::warn!(
+                    job_id = %job_id,
+                    vault = %vault_name,
+                    error = %err,
+                    "import chunk failed"
+                );
+                return Err(err.into());
+            }
+        }
+    }
+    Err(last_err
+        .unwrap_or(archiveos_contract::VaultError::InvalidLayout {
+            detail: "import chunk failed".into(),
+        })
+        .into())
+}
+
+#[derive(Deserialize)]
+struct ImportChunkRequest {
+    #[serde(flatten)]
+    manifest: ImportManifest,
+    #[serde(default)]
+    finalize: bool,
+    #[serde(default)]
+    status: Option<String>,
+}
+
+async fn import_chunk(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, job_id)): Path<(String, Uuid)>,
+    Json(body): Json<ImportChunkRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    let job = vault.get_job(job_id)?;
+    if job.is_none() {
+        return Err(archiveos_contract::VaultError::NotFound.into());
     }
 
-    let complete = manifest.items.iter().filter(|i| i.status == "complete").count();
-    let failed = manifest
-        .items
-        .iter()
-        .filter(|i| i.status == "failed")
-        .count();
-    if failed > 0 && complete > 0 {
-        "partial".to_string()
-    } else if failed > 0 && complete == 0 {
-        "failed".to_string()
+    let staging = vault.staging_job_dir(&job_id.to_string());
+    let report = import_chunk_with_retry(
+        &vault,
+        &staging,
+        &body.manifest,
+        body.finalize,
+        job_id,
+        &vault_name,
+    )?;
+
+    if body.finalize {
+        let final_status = resolve_job_status(&body.manifest, body.status.as_deref());
+        let failures = vault.list_failures_for_job(job_id)?;
+        let finish_progress =
+            archiveos_core::jobs::build_finish_progress(&body.manifest, &failures);
+        vault.update_job_progress(job_id, &finish_progress)?;
+        vault.finish_job(job_id, &final_status)?;
+        enqueue_preview_jobs_from_manifest(&vault, &vault_name, &body.manifest, job_id)?;
+        maybe_bind_subscription_collection(&vault, job_id, &body.manifest)?;
+        Ok(Json(serde_json::json!({
+            "job_id": job_id,
+            "status": final_status,
+            "finalized": true,
+            "entities_created": report.entities_created,
+            "entities_reused": report.entities_reused,
+            "blobs_stored": report.blobs_stored,
+            "items_skipped": report.items_skipped,
+        })))
     } else {
-        "done".to_string()
+        Ok(Json(serde_json::json!({
+            "job_id": job_id,
+            "finalized": false,
+            "entities_created": report.entities_created,
+            "entities_reused": report.entities_reused,
+            "blobs_stored": report.blobs_stored,
+            "items_skipped": report.items_skipped,
+        })))
     }
 }
 
@@ -804,8 +970,13 @@ async fn submit_manifest(
     }
 
     let staging = vault.staging_job_dir(&job_id.to_string());
-    let report = vault.import(&staging, Some(&body.manifest), ImportStrategy::Managed)?;
+    let report =
+        import_manifest_with_retry(&vault, &staging, &body.manifest, job_id, &vault_name)?;
     let final_status = resolve_job_status(&body.manifest, body.status.as_deref());
+    let failures = vault.list_failures_for_job(job_id)?;
+    let finish_progress =
+        archiveos_core::jobs::build_finish_progress(&body.manifest, &failures);
+    vault.update_job_progress(job_id, &finish_progress)?;
     vault.finish_job(job_id, &final_status)?;
     enqueue_preview_jobs_from_manifest(&vault, &vault_name, &body.manifest, job_id)?;
     maybe_bind_subscription_collection(&vault, job_id, &body.manifest)?;
@@ -986,6 +1157,15 @@ async fn list_source_failures(
     let vault = open_vault(&state, &vault_name)?;
     let failures = vault.list_source_failures(params.source.as_deref(), params.kind.as_deref())?;
     Ok(Json(failures.into_iter().map(SourceFailureResponse::from).collect()))
+}
+
+async fn delete_source_failure(
+    State(state): State<Arc<AppState>>,
+    Path((vault_name, failure_id)): Path<(String, Uuid)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let vault = open_vault(&state, &vault_name)?;
+    vault.delete_source_failure(failure_id)?;
+    Ok(Json(serde_json::json!({ "id": failure_id, "deleted": true })))
 }
 
 #[derive(Deserialize)]

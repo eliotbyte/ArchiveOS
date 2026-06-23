@@ -1,8 +1,32 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import requests
+
+
+def api_error_message(response: requests.Response) -> str:
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            if error := body.get("error"):
+                return str(error)
+    except ValueError:
+        pass
+    text = response.text.strip()
+    return text or response.reason or f"HTTP {response.status_code}"
+
+
+def http_error_message(response: requests.Response) -> str:
+    return f"{response.status_code} {response.reason}: {api_error_message(response)}"
+
+
+def manifest_submit_retryable(message: str, response: requests.Response) -> bool:
+    text = message.lower()
+    if response.status_code >= 500:
+        return True
+    return "import file not found" in text
 
 
 class JobCancelled(Exception):
@@ -90,17 +114,65 @@ class CoreClient:
         manifest: dict[str, Any],
         *,
         status: str | None = None,
+        max_attempts: int = 1,
+        retry_backoff_secs: float = 0.5,
     ) -> dict[str, Any]:
         payload = dict(manifest)
         if status:
             payload["status"] = status
-        response = self.session.post(
-            f"{self.core_url}/vaults/{self.vault_name}/jobs/{job_id}/manifest",
-            json=payload,
-            timeout=120,
-        )
-        response.raise_for_status()
-        return response.json()
+        last_error: requests.HTTPError | None = None
+        for attempt in range(max_attempts):
+            response = self.session.post(
+                f"{self.core_url}/vaults/{self.vault_name}/jobs/{job_id}/manifest",
+                json=payload,
+                timeout=180,
+            )
+            if response.ok:
+                return response.json()
+            message = http_error_message(response)
+            last_error = requests.HTTPError(message, response=response)
+            if attempt + 1 >= max_attempts or not manifest_submit_retryable(
+                message, response
+            ):
+                raise last_error
+            time.sleep(retry_backoff_secs * (2**attempt))
+        assert last_error is not None
+        raise last_error
+
+    def import_chunk(
+        self,
+        job_id: str,
+        manifest: dict[str, Any],
+        *,
+        finalize: bool = False,
+        status: str | None = None,
+        max_attempts: int = 1,
+        retry_backoff_secs: float = 0.5,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "finalize": finalize,
+            **manifest,
+        }
+        if status:
+            payload["status"] = status
+        last_error: requests.HTTPError | None = None
+        for attempt in range(max_attempts):
+            response = self.session.post(
+                f"{self.core_url}/vaults/{self.vault_name}/jobs/{job_id}/import-chunk",
+                json=payload,
+                timeout=180,
+            )
+            if response.ok:
+                return response.json()
+            message = http_error_message(response)
+            last_error = requests.HTTPError(message, response=response)
+            if attempt + 1 >= max_attempts or not manifest_submit_retryable(
+                message, response
+            ):
+                raise last_error
+            time.sleep(retry_backoff_secs * (2**attempt))
+        assert last_error is not None
+        raise last_error
 
     def get_entity(self, entity_id: str) -> dict[str, Any]:
         response = self.session.get(

@@ -247,3 +247,37 @@ def test_channel_from_info_and_relation():
     assert channel["external_id"] == "UC123"
     relation = uploaded_by_relation("vid1", "UC123", "youtube")
     assert relation["relation"] == "uploaded_by"
+
+
+def test_build_manifest_ensures_uploaded_by_from_item_metadata():
+    from worker.manifest_builder import build_item, ensure_uploaded_by_relations
+
+    item = build_item(
+        video_id="vid-new",
+        relative_path="files/vid-new.mp4",
+        status="complete",
+        info={
+            "id": "vid-new",
+            "title": "New Video",
+            "channel_id": "UC999",
+            "channel": "Test Channel",
+            "extractor_key": "Youtube",
+        },
+        source="youtube",
+    )
+    relations = ensure_uploaded_by_relations(
+        [item],
+        [
+            {
+                "source": "youtube",
+                "kind": "channel",
+                "external_id": "UC999",
+                "url": "https://youtube.com/channel/UC999",
+            }
+        ],
+        [],
+        "youtube",
+    )
+    assert len(relations) == 1
+    assert relations[0]["from_external_id"] == "vid-new"
+    assert relations[0]["to_external_id"] == "UC999"

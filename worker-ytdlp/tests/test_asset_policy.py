@@ -1,6 +1,6 @@
 from worker.asset_policy import AssetPolicy, filter_track_catalog, video_format_selector
 from worker.job_input import parse_job_input
-from worker.ytdlp_args import cookies_args
+from worker.ytdlp_args import cookies_args, ytdlp_extra_args
 from worker.config import Config
 
 
@@ -52,3 +52,27 @@ def test_cookies_args_when_configured():
         ytdlp_cookies_dir="/vault/workers/ytdlp/cookies",
     )
     assert cookies_args(config) == ["--cookies", "/vault/cookies.txt"]
+
+
+def test_ytdlp_extra_args_includes_ejs_and_cookies():
+    config = Config(
+        core_url="http://core",
+        vault_name="v",
+        vault_path="/vault",
+        job_poll_secs=1,
+        job_lease_secs=30,
+        ytdlp_update_on_start=False,
+        ytdlp_auto_update=False,
+        ytdlp_update_interval_secs=3600,
+        ytdlp_playlist_max_items=None,
+        ytdlp_cookies_path="/vault/cookies.txt",
+        ytdlp_worker_dir="/vault/workers/ytdlp",
+        ytdlp_cache_dir="/vault/workers/ytdlp/cache",
+        ytdlp_cookies_dir="/vault/workers/ytdlp/cookies",
+    )
+    assert ytdlp_extra_args(config) == [
+        "--remote-components",
+        "ejs:github",
+        "--cookies",
+        "/vault/cookies.txt",
+    ]

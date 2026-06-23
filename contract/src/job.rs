@@ -7,6 +7,8 @@ pub struct JobProgressStep {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -147,7 +147,15 @@ pub fn migrate(conn: &Connection) -> Result<(), VaultError> {
 }
 
 pub fn open_connection(path: &std::path::Path) -> Result<Connection, VaultError> {
-    Connection::open(path).map_err(db_err)
+    let conn = Connection::open(path).map_err(db_err)?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))
+        .map_err(db_err)?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;",
+    )
+    .map_err(db_err)?;
+    Ok(conn)
 }
 
 fn db_err(err: rusqlite::Error) -> VaultError {

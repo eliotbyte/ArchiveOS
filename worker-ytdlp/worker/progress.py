@@ -112,3 +112,31 @@ def build_video_steps(
             }
         )
     return steps
+
+
+def build_asset_steps(
+    asset_ids: list[str],
+    labels: dict[str, str],
+    *,
+    kind: str = "thumbnail",
+    running_id: str | None = None,
+    done_ids: set[str] | None = None,
+    failed_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    done_ids = done_ids or set()
+    failed_ids = failed_ids or set()
+    prefix = "Thumbnail" if kind == "thumbnail" else "Avatar"
+    steps: list[dict[str, Any]] = []
+    for asset_id in asset_ids:
+        base_label = labels.get(asset_id, asset_id)
+        label = f"{prefix}: {base_label}"
+        if asset_id in failed_ids:
+            status = "failed"
+        elif asset_id in done_ids:
+            status = "done"
+        elif asset_id == running_id:
+            status = "running"
+        else:
+            status = "pending"
+        steps.append({"id": asset_id, "label": label, "status": status})
+    return steps

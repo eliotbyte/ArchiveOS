@@ -1,4 +1,5 @@
 from worker.progress import (
+    build_asset_steps,
     build_progress,
     build_video_steps,
     parse_download_percent,
@@ -38,3 +39,17 @@ def test_video_labels_from_probe_playlist() -> None:
 def test_build_progress_minimal() -> None:
     payload = build_progress(phase="discovering", label="https://example.com")
     assert payload == {"phase": "discovering", "label": "https://example.com"}
+
+
+def test_build_asset_steps_thumbnail() -> None:
+    steps = build_asset_steps(
+        ["vid1:thumbnail", "vid2:thumbnail"],
+        {"vid1:thumbnail": "Video One", "vid2:thumbnail": "Video Two"},
+        kind="thumbnail",
+        running_id="vid2:thumbnail",
+        done_ids={"vid1:thumbnail"},
+        failed_ids=set(),
+    )
+    assert steps[0]["status"] == "done"
+    assert steps[0]["label"] == "Thumbnail: Video One"
+    assert steps[1]["status"] == "running"

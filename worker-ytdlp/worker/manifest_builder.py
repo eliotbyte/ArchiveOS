@@ -286,6 +286,72 @@ def with_thumbnail_metadata(info: dict[str, Any], video_id: str) -> dict[str, An
     return enriched
 
 
+def ensure_uploaded_by_relations(
+    items: list[dict[str, Any]],
+    channels: list[dict[str, Any]],
+    relations: list[dict[str, Any]],
+    source: str,
+) -> list[dict[str, Any]]:
+    from .channels import uploaded_by_relation
+
+    existing = {
+        (relation["from_external_id"], relation["to_external_id"])
+        for relation in relations
+        if relation.get("relation") == "uploaded_by"
+    }
+    out = list(relations)
+    for item in items:
+        if item.get("status") != "complete":
+            continue
+        source_ref = item.get("source_ref") or {}
+        if source_ref.get("kind") != "video":
+            continue
+        video_id = source_ref.get("external_id")
+        if not video_id:
+            continue
+        metadata = item.get("metadata") or {}
+        ytdlp = (item.get("metadata_by_provenance") or {}).get("yt-dlp") or {}
+        channel_external_id = ytdlp.get("channel_id") or metadata.get("channel_id")
+        if not channel_external_id:
+            continue
+        key = (video_id, channel_external_id)
+        if key in existing:
+            continue
+        out.append(uploaded_by_relation(video_id, channel_external_id, source))
+        existing.add(key)
+    return out
+
+
+def build_playlist_chunk_manifest(
+    *,
+    vault_name: str,
+    input_url: str,
+    probe: dict[str, Any],
+    source: str,
+    items: list[dict[str, Any]],
+    channels: list[dict[str, Any]],
+    relations: list[dict[str, Any]],
+    membership: list[dict[str, Any]],
+    asset_policy: AssetPolicy | None = None,
+) -> dict[str, Any]:
+    return {
+        "source": "yt-dlp",
+        "source_identity": source,
+        "vault": vault_name,
+        "strategy": "managed",
+        "collection": build_collection(probe, input_url, source),
+        "channels": channels,
+        "items": items,
+        "membership": membership,
+        "relations": ensure_uploaded_by_relations(
+            items,
+            channels,
+            relations,
+            source,
+        ),
+    }
+
+
 def build_manifest(
     *,
     vault_name: str,
@@ -328,7 +394,12 @@ def build_manifest(
         "strategy": "managed",
         "channels": list(channels_by_id.values()),
         "items": [*items, *discovery_items],
-        "relations": relations,
+        "relations": ensure_uploaded_by_relations(
+            [*items, *discovery_items],
+            list(channels_by_id.values()),
+            relations,
+            resolved_source,
+        ),
     }
     if is_playlist(probe):
         manifest["collection"] = build_collection(probe, input_url, resolved_source)

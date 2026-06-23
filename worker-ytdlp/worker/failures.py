@@ -15,11 +15,22 @@ def classify_error(message: str) -> tuple[str, bool]:
         return "region_locked", False
     if "requested format is not available" in text or "no video formats" in text:
         return "no_formats", True
-    if any(token in text for token in ("timed out", "connection", "network", "http error", "unable to download")):
+    if any(token in text for token in ("timed out", "connection", "network", "unable to download")):
         return "network", True
     if "validation" in text:
         return "validation_failed", True
     return "unknown", True
+
+
+def classify_import_error(message: str) -> tuple[str, bool]:
+    text = message.lower()
+    if "import file not found" in text:
+        return "staging_file_missing", True
+    if "sha256 mismatch" in text:
+        return "validation_failed", False
+    if "bad request" in text or "invalid layout" in text:
+        return "import_rejected", False
+    return classify_error(message)
 
 
 def error_kind_to_item_status(error_kind: str) -> str:

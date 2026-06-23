@@ -18,6 +18,64 @@ pub fn find_entity_by_content_hash(
     .transpose()
 }
 
+pub fn find_playlist_entity_ids_by_external_id(
+    conn: &Connection,
+    external_id: &str,
+) -> Result<Vec<Uuid>, VaultError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT sr.entity_id
+             FROM source_ref sr
+             JOIN entity e ON e.id = sr.entity_id
+             WHERE sr.kind = 'playlist' AND sr.external_id = ?1
+             ORDER BY e.added_at ASC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([external_id], |row| row.get::<_, String>(0))
+        .map_err(db_err)?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(Uuid::parse_str(&row.map_err(db_err)?).map_err(|e| VaultError::InvalidLayout {
+            detail: e.to_string(),
+        })?);
+    }
+    Ok(ids)
+}
+
+pub fn merge_collection_members(
+    conn: &Connection,
+    from_collection_id: Uuid,
+    to_collection_id: Uuid,
+) -> Result<(), VaultError> {
+    if from_collection_id == to_collection_id {
+        return Ok(());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT entity_id, position FROM collection_member WHERE collection_id = ?1",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([from_collection_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })
+        .map_err(db_err)?;
+    for row in rows {
+        let (entity_id, position) = row.map_err(db_err)?;
+        let entity_id = Uuid::parse_str(&entity_id).map_err(|e| VaultError::InvalidLayout {
+            detail: e.to_string(),
+        })?;
+        link_collection_member_direct(conn, to_collection_id, entity_id, position)?;
+    }
+    conn.execute(
+        "DELETE FROM collection_member WHERE collection_id = ?1",
+        [from_collection_id.to_string()],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 pub fn find_entity_by_source_ref(
     conn: &Connection,
     source: &str,

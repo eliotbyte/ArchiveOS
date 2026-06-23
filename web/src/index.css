@@ -2006,6 +2006,25 @@ button:disabled {
   align-items: flex-start;
 }
 
+.job-item-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.job-dismiss {
+  min-width: 36px;
+  padding: 6px 10px;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.job-step-error {
+  color: #f28b82;
+  margin-top: 4px;
+}
+
 .job-item-body {
   flex: 1;
   min-width: 0;

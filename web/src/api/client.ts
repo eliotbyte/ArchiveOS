@@ -368,6 +368,12 @@ export function createApi(vaultName: string) {
         method: "POST",
       }),
 
+    deleteJob: (jobId: string) =>
+      request<{ job_id: string; deleted: boolean }>(
+        `/vaults/${vaultName}/jobs/${jobId}`,
+        { method: "DELETE" },
+      ),
+
     listSubscriptions: () =>
       request<Subscription[]>(`/vaults/${vaultName}/subscriptions`),
 
@@ -390,6 +396,12 @@ export function createApi(vaultName: string) {
         `/vaults/${vaultName}/source-failures${suffix}`,
       );
     },
+
+    deleteSourceFailure: (failureId: string) =>
+      request<{ id: string; deleted: boolean }>(
+        `/vaults/${vaultName}/source-failures/${failureId}`,
+        { method: "DELETE" },
+      ),
 
     archiveUrl: (body: ArchiveRequest) =>
       request<Job>(`/vaults/${vaultName}/archive`, {
@@ -623,6 +635,7 @@ export interface JobProgressStep {
   label: string;
   status: string;
   percent?: number | null;
+  message?: string | null;
 }
 
 export interface JobProgress {
@@ -649,6 +662,7 @@ export interface Job {
 
 export interface JobDetail extends Job {
   children?: Job[];
+  failures?: SourceFailure[];
 }
 
 export interface Subscription {

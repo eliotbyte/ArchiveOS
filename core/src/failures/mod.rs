@@ -128,6 +128,33 @@ pub fn list_failures(
     rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
 }
 
+pub fn list_failures_for_job(
+    conn: &Connection,
+    job_id: Uuid,
+) -> Result<Vec<SourceFailure>, VaultError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, job_id, source, kind, external_id, url, stage, error_kind,
+                    message, retryable, attempts, last_seen_at, created_at
+             FROM source_failure WHERE job_id = ?1 ORDER BY last_seen_at DESC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([job_id.to_string()], map_failure)
+        .map_err(db_err)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(db_err)
+}
+
+pub fn delete_failure(conn: &Connection, id: Uuid) -> Result<(), VaultError> {
+    let changed = conn
+        .execute("DELETE FROM source_failure WHERE id = ?1", [id.to_string()])
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(VaultError::NotFound);
+    }
+    Ok(())
+}
+
 pub fn get_failure(conn: &Connection, id: Uuid) -> Result<Option<SourceFailure>, VaultError> {
     conn.query_row(
         "SELECT id, job_id, source, kind, external_id, url, stage, error_kind,

@@ -38,6 +38,16 @@ pub fn resolve_uploaded_by_channel(
     conn: &Connection,
     video_entity_id: Uuid,
 ) -> Result<Option<UploadedByChannel>, VaultError> {
+    if let Some(channel) = resolve_uploaded_by_relation(conn, video_entity_id)? {
+        return Ok(Some(channel));
+    }
+    resolve_uploaded_by_metadata(conn, video_entity_id, true)
+}
+
+pub(crate) fn resolve_uploaded_by_relation(
+    conn: &Connection,
+    video_entity_id: Uuid,
+) -> Result<Option<UploadedByChannel>, VaultError> {
     let channel_entity_id: Option<String> = conn
         .query_row(
             "SELECT to_entity_id FROM entity_relation
@@ -63,6 +73,53 @@ pub fn resolve_uploaded_by_channel(
         title: metadata_value(conn, channel_entity_id, "title")?,
         avatar_preview: resolve_channel_avatar_preview(conn, channel_entity_id)?,
     }))
+}
+
+fn video_platform_source(conn: &Connection, video_entity_id: Uuid) -> Result<String, VaultError> {
+    let source: Option<String> = conn
+        .query_row(
+            "SELECT source FROM source_ref WHERE entity_id = ?1 AND kind = 'video' LIMIT 1",
+            [video_entity_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    Ok(match source {
+        Some(source) => crate::import::db::canonical_platform_source(&source).to_string(),
+        None => "youtube".to_string(),
+    })
+}
+
+fn resolve_uploaded_by_metadata(
+    conn: &Connection,
+    video_entity_id: Uuid,
+    link_relation: bool,
+) -> Result<Option<UploadedByChannel>, VaultError> {
+    let platform = video_platform_source(conn, video_entity_id)?;
+    for key in ["channel_id", "uploader_id"] {
+        let Some(external_id) = metadata_value(conn, video_entity_id, key)? else {
+            continue;
+        };
+        let Some(channel_entity_id) =
+            crate::import::db::find_entity_by_source_ref(conn, &platform, "channel", &external_id)?
+        else {
+            continue;
+        };
+        if link_relation {
+            crate::import::db::link_entity_relation(
+                conn,
+                video_entity_id,
+                channel_entity_id,
+                "uploaded_by",
+            )?;
+        }
+        return Ok(Some(UploadedByChannel {
+            channel_entity_id,
+            title: metadata_value(conn, channel_entity_id, "title")?,
+            avatar_preview: resolve_channel_avatar_preview(conn, channel_entity_id)?,
+        }));
+    }
+    Ok(None)
 }
 
 pub fn batch_resolve_uploaded_by_channels(
@@ -120,6 +177,14 @@ pub fn batch_resolve_uploaded_by_channels(
     for (video_id, channel_id) in video_to_channel {
         if let Some(info) = channel_info.get(&channel_id) {
             result.insert(video_id, info.clone());
+        }
+    }
+    for video_id in video_entity_ids {
+        if result.contains_key(video_id) {
+            continue;
+        }
+        if let Some(channel) = resolve_uploaded_by_metadata(conn, *video_id, true)? {
+            result.insert(*video_id, channel);
         }
     }
     Ok(result)
@@ -325,5 +390,75 @@ mod tests {
 
         let resolved = resolve_uploaded_by_channel(conn, video_id).unwrap().unwrap();
         assert!(resolved.avatar_preview.is_none());
+    }
+
+    #[test]
+    fn resolve_uploaded_by_channel_falls_back_to_metadata_channel_id() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let conn = vault.connection();
+        let now = Utc::now().to_rfc3339();
+
+        let video_id = Uuid::new_v4();
+        let channel_id = Uuid::new_v4();
+        insert_entity(conn, video_id, None, Some("video/mp4"), 0, "present", &now, None).unwrap();
+        insert_entity(conn, channel_id, None, None, 0, "active", &now, None).unwrap();
+        insert_source_ref(
+            conn,
+            Uuid::new_v4(),
+            video_id,
+            "youtube",
+            "video",
+            "new-vid",
+            Some("https://youtube.com/watch?v=new-vid"),
+            "live",
+        )
+        .unwrap();
+        insert_source_ref(
+            conn,
+            Uuid::new_v4(),
+            channel_id,
+            "youtube",
+            "channel",
+            "UC999",
+            Some("https://youtube.com/channel/UC999"),
+            "live",
+        )
+        .unwrap();
+        upsert_metadata(conn, channel_id, "title", "Avatar Channel", "yt-dlp").unwrap();
+        upsert_metadata(conn, video_id, "channel_id", "UC999", "yt-dlp").unwrap();
+        upsert_metadata(conn, video_id, "channel", "Avatar Channel", "yt-dlp").unwrap();
+
+        let asset_id = crate::assets::upsert_asset(
+            conn,
+            &UpsertAssetInput {
+                entity_id: channel_id,
+                role: "supporting",
+                kind: "avatar",
+                content_hash: Some("abc123"),
+                mime: Some("image/jpeg"),
+                size: 100,
+                ext: Some("jpg"),
+                status: "present",
+                storage_strategy: "managed",
+                path: None,
+            },
+        )
+        .unwrap();
+        crate::assets::upsert_asset_metadata(conn, asset_id, "preview_role", "avatar", "archiveos")
+            .unwrap();
+
+        let resolved = resolve_uploaded_by_channel(conn, video_id).unwrap().unwrap();
+        assert_eq!(resolved.channel_entity_id, channel_id);
+        assert!(resolved.avatar_preview.is_some());
+
+        let relation_count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entity_relation WHERE relation = 'uploaded_by'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relation_count, 1);
     }
 }

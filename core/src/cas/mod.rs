@@ -50,7 +50,6 @@ pub fn store_managed(
     let dest = blob_path(vault_root, &content_hash, ext)?;
 
     if dest.exists() {
-        fs::remove_file(staging_file)?;
         return Ok(CasStoreResult {
             content_hash,
             blob_path: dest,
@@ -63,20 +62,7 @@ pub fn store_managed(
         fs::create_dir_all(parent)?;
     }
 
-    fs::rename(staging_file, &dest).map_err(|err| {
-        if err.raw_os_error() == Some(18) {
-            // EXDEV: cross-device link — should not happen within vault volume
-            VaultError::InvalidLayout {
-                detail: format!(
-                    "atomic rename failed across filesystems: {} -> {}",
-                    staging_file.display(),
-                    dest.display()
-                ),
-            }
-        } else {
-            VaultError::Io(err)
-        }
-    })?;
+    fs::copy(staging_file, &dest).map_err(VaultError::Io)?;
 
     Ok(CasStoreResult {
         content_hash,
@@ -108,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn store_moves_staging_file_to_sharded_blob_path() {
+    fn store_copies_staging_file_to_sharded_blob_path() {
         let vault_root = tempdir().unwrap();
         std::fs::create_dir_all(vault_root.path().join("blobs")).unwrap();
 
@@ -119,7 +105,7 @@ mod tests {
         let result = store_managed(vault_root.path(), &staging, ".mp4").unwrap();
         assert!(!result.deduped);
         assert!(result.blob_path.exists());
-        assert!(!staging.exists());
+        assert!(staging.exists());
         assert_eq!(
             result.blob_path,
             vault_root.path().join(format!(
@@ -132,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn store_dedup_deletes_staging_when_blob_exists() {
+    fn store_dedup_keeps_staging_when_blob_exists() {
         let vault_root = tempdir().unwrap();
         std::fs::create_dir_all(vault_root.path().join("blobs")).unwrap();
 
@@ -150,7 +136,7 @@ mod tests {
         assert!(second.deduped);
         assert_eq!(first.content_hash, second.content_hash);
         assert_eq!(first.blob_path, second.blob_path);
-        assert!(!staging2.exists());
+        assert!(staging2.exists());
         assert_eq!(
             std::fs::read(&first.blob_path).unwrap(),
             b"same-content".as_slice()

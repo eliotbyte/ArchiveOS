@@ -17,6 +17,7 @@ services:
 
   ytdlp-worker:
     build: ./worker-ytdlp
+    restart: unless-stopped
     depends_on:
       - core
     volumes:
@@ -33,6 +34,7 @@ services:
 
   thumbnail-worker:
     build: ./worker-thumbnail
+    restart: unless-stopped
     depends_on:
       - core
     volumes:

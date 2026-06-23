@@ -17,18 +17,50 @@ use crate::assets::UpsertAssetInput;
 use crate::cas::{self, CasStoreResult};
 use crate::Vault;
 
+pub struct ImportOptions {
+    pub cleanup_staging: bool,
+    pub finalize_membership: bool,
+}
+
+impl Default for ImportOptions {
+    fn default() -> Self {
+        Self {
+            cleanup_staging: true,
+            finalize_membership: true,
+        }
+    }
+}
+
 pub fn import(
     vault: &Vault,
     staging_dir: &Path,
     manifest: Option<&ImportManifest>,
     strategy: ImportStrategy,
 ) -> Result<ImportReport, VaultError> {
+    import_with_options(vault, staging_dir, manifest, strategy, ImportOptions::default())
+}
+
+pub fn import_with_options(
+    vault: &Vault,
+    staging_dir: &Path,
+    manifest: Option<&ImportManifest>,
+    strategy: ImportStrategy,
+    options: ImportOptions,
+) -> Result<ImportReport, VaultError> {
     let mut report = ImportReport::default();
     let conn = vault.connection();
 
     if let Some(manifest) = manifest {
-        import_from_manifest(vault, conn, staging_dir, manifest, strategy, &mut report)?;
-        if strategy == ImportStrategy::Managed {
+        import_from_manifest(
+            vault,
+            conn,
+            staging_dir,
+            manifest,
+            strategy,
+            options.finalize_membership,
+            &mut report,
+        )?;
+        if strategy == ImportStrategy::Managed && options.cleanup_staging {
             cleanup_staging(staging_dir)?;
         }
     } else {
@@ -44,6 +76,7 @@ fn import_from_manifest(
     staging_dir: &Path,
     manifest: &ImportManifest,
     strategy: ImportStrategy,
+    finalize_membership: bool,
     report: &mut ImportReport,
 ) -> Result<(), VaultError> {
     for channel in &manifest.channels {
@@ -90,11 +123,76 @@ fn import_from_manifest(
                 active_members.push(entity_id);
             }
         }
-        db::mark_collection_members_removed_except(conn, collection_id, &active_members)?;
+        if finalize_membership {
+            db::mark_collection_members_removed_except(conn, collection_id, &active_members)?;
+        }
     }
 
     for relation in &manifest.relations {
         import_relation(conn, relation)?;
+    }
+
+    ensure_uploaded_by_relations_from_manifest(conn, manifest)?;
+
+    Ok(())
+}
+
+fn channel_external_id_from_item(item: &ManifestItem) -> Option<String> {
+    if let Some(ytdlp) = item.metadata_by_provenance.get("yt-dlp") {
+        if let Some(channel_id) = ytdlp.get("channel_id").and_then(|v| v.as_str()) {
+            if !channel_id.is_empty() {
+                return Some(channel_id.to_string());
+            }
+        }
+    }
+    if let Some(metadata) = &item.metadata {
+        if let Some(channel_id) = metadata.get("channel_id").and_then(|v| v.as_str()) {
+            if !channel_id.is_empty() {
+                return Some(channel_id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn ensure_uploaded_by_relations_from_manifest(
+    conn: &Connection,
+    manifest: &ImportManifest,
+) -> Result<(), VaultError> {
+    let platform = manifest_source_identity(manifest).unwrap_or_else(|| "youtube".into());
+    let platform = db::canonical_platform_source(&platform);
+
+    for item in &manifest.items {
+        if item.status != "complete" {
+            continue;
+        }
+        let Some(video_ref) = item.source_ref.as_ref() else {
+            continue;
+        };
+        if video_ref.kind != "video" {
+            continue;
+        }
+        let Some(video_entity_id) = db::find_entity_by_source_ref(
+            conn,
+            platform,
+            &video_ref.kind,
+            &video_ref.external_id,
+        )?
+        else {
+            continue;
+        };
+        if crate::channels::resolve_uploaded_by_relation(conn, video_entity_id)?.is_some() {
+            continue;
+        }
+        let Some(channel_external_id) = channel_external_id_from_item(item) else {
+            continue;
+        };
+        let Some(channel_entity_id) =
+            db::find_entity_by_source_ref(conn, platform, "channel", &channel_external_id)?
+        else {
+            continue;
+        };
+        db::link_entity_relation(conn, video_entity_id, channel_entity_id, "uploaded_by")?;
     }
 
     Ok(())
@@ -202,9 +300,10 @@ fn import_channel_avatar(
 }
 
 fn import_relation(conn: &Connection, relation: &ManifestRelation) -> Result<(), VaultError> {
+    let source = db::canonical_platform_source(&relation.source);
     let Some(from_id) = db::find_entity_by_source_ref(
         conn,
-        &relation.source,
+        source,
         &relation.from_kind,
         &relation.from_external_id,
     )?
@@ -213,7 +312,7 @@ fn import_relation(conn: &Connection, relation: &ManifestRelation) -> Result<(),
     };
     let Some(to_id) = db::find_entity_by_source_ref(
         conn,
-        &relation.source,
+        source,
         &relation.to_kind,
         &relation.to_external_id,
     )?
@@ -236,6 +335,14 @@ fn import_relation(conn: &Connection, relation: &ManifestRelation) -> Result<(),
     Ok(())
 }
 
+fn collection_source_kind(collection_type: &str) -> &'static str {
+    if collection_type.contains("channel") {
+        "channel"
+    } else {
+        "playlist"
+    }
+}
+
 fn import_collection(
     conn: &Connection,
     collection: &archiveos_contract::ManifestCollection,
@@ -244,10 +351,33 @@ fn import_collection(
     let source = manifest_source_identity(manifest).ok_or_else(|| VaultError::InvalidLayout {
         detail: "manifest missing source_identity for collection import".into(),
     })?;
+    let source_kind = collection_source_kind(&collection.collection_type);
+
+    if source_kind == "playlist" {
+        let playlist_ids =
+            db::find_playlist_entity_ids_by_external_id(conn, &collection.external_id)?;
+        if let Some(canonical) = playlist_ids.first().copied() {
+            for duplicate in playlist_ids.iter().skip(1) {
+                db::merge_collection_members(conn, *duplicate, canonical)?;
+            }
+            db::upsert_source_ref(
+                conn,
+                canonical,
+                &archiveos_contract::ManifestSourceRef {
+                    source: db::canonical_platform_source(&source).to_string(),
+                    kind: "playlist".into(),
+                    external_id: collection.external_id.clone(),
+                    url: Some(collection.url.clone()),
+                },
+            )?;
+            return Ok(canonical);
+        }
+    }
+
     if let Some(existing) = db::find_entity_by_source_ref(
         conn,
         &source,
-        "playlist",
+        source_kind,
         &collection.external_id,
     )? {
         return Ok(existing);
@@ -274,7 +404,7 @@ fn import_collection(
         Uuid::new_v4(),
         id,
         &source,
-        "playlist",
+        source_kind,
         &collection.external_id,
         Some(&collection.url),
         "live",
@@ -1021,6 +1151,127 @@ mod tests {
             .connection()
             .query_row(
                 "SELECT COUNT(*) FROM source_ref WHERE kind = 'playlist' AND external_id = 'PL123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(playlist_entities, 1);
+    }
+
+    #[test]
+    fn import_collection_merges_playlist_duplicates_across_source_keys() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path().join("vault")).unwrap();
+        let conn = vault.connection();
+        let now = Utc::now().to_rfc3339();
+
+        let legacy_id = Uuid::new_v4();
+        db::insert_entity(conn, legacy_id, None, None, 0, "active", &now, None).unwrap();
+        db::insert_collection(
+            conn,
+            legacy_id,
+            "youtube_playlist",
+            "Legacy playlist",
+        )
+        .unwrap();
+        db::insert_source_ref(
+            conn,
+            Uuid::new_v4(),
+            legacy_id,
+            "yt-dlp",
+            "playlist",
+            "PLdup",
+            Some("https://youtube.com/playlist?list=PLdup"),
+            "live",
+        )
+        .unwrap();
+        let legacy_video = db::resolve_or_create_entity_by_source_ref(
+            conn,
+            "youtube",
+            "video",
+            "vid-legacy",
+            None,
+        )
+        .unwrap();
+        db::link_collection_member_direct(conn, legacy_id, legacy_video, 0).unwrap();
+
+        let duplicate_id = Uuid::new_v4();
+        db::insert_entity(conn, duplicate_id, None, None, 0, "active", &now, None).unwrap();
+        db::insert_collection(
+            conn,
+            duplicate_id,
+            "youtube_playlist",
+            "Duplicate playlist",
+        )
+        .unwrap();
+        db::insert_source_ref(
+            conn,
+            Uuid::new_v4(),
+            duplicate_id,
+            "youtube",
+            "playlist",
+            "PLdup",
+            Some("https://youtube.com/playlist?list=PLdup"),
+            "live",
+        )
+        .unwrap();
+        let duplicate_video = db::resolve_or_create_entity_by_source_ref(
+            conn,
+            "youtube",
+            "video",
+            "vid-new",
+            None,
+        )
+        .unwrap();
+        db::link_collection_member_direct(conn, duplicate_id, duplicate_video, 1).unwrap();
+
+        let staging = dir.path().join("staging/resync");
+        fs::create_dir_all(&staging).unwrap();
+        let manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            source_identity: Some("youtube".into()),
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: Some(ManifestCollection {
+                collection_type: "youtube_playlist".into(),
+                external_id: "PLdup".into(),
+                url: "https://youtube.com/playlist?list=PLdup".into(),
+                title: "Merged playlist".into(),
+            }),
+            channels: vec![],
+            items: vec![],
+            membership: vec![
+                archiveos_contract::ManifestMembership {
+                    external_id: "vid-legacy".into(),
+                    position: 0,
+                    kind: "video".into(),
+                    url: None,
+                },
+                archiveos_contract::ManifestMembership {
+                    external_id: "vid-new".into(),
+                    position: 1,
+                    kind: "video".into(),
+                    url: None,
+                },
+            ],
+            relations: vec![],
+        };
+
+        let report = import(&vault, &staging, Some(&manifest), ImportStrategy::Managed).unwrap();
+        assert_eq!(report.collection_id, Some(legacy_id));
+
+        let members: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM collection_member WHERE collection_id = ?1 AND status = 'active'",
+                [legacy_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 2);
+
+        let playlist_entities: i32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT entity_id) FROM source_ref WHERE kind = 'playlist' AND external_id = 'PLdup'",
                 [],
                 |row| row.get(0),
             )

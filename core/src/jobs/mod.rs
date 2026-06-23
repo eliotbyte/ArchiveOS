@@ -1,4 +1,5 @@
-use archiveos_contract::{JobProgress, VaultError, YtdlpJobInput};
+use archiveos_contract::{ImportManifest, JobProgress, JobProgressStep, ManifestItem, VaultError, YtdlpJobInput};
+use crate::failures::SourceFailure;
 use chrono::{Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
@@ -101,6 +102,7 @@ pub fn claim_job(
     job_type: Option<&str>,
 ) -> Result<Option<Job>, VaultError> {
     requeue_expired_jobs(conn)?;
+    let _ = purge_terminal_jobs(conn, 24);
     let lease_until = (Utc::now() + Duration::seconds(lease_secs)).to_rfc3339();
 
     let job = if let Some(job_type) = job_type {
@@ -364,6 +366,335 @@ pub fn finish_job(conn: &Connection, job_id: Uuid, status: &str) -> Result<(), V
     Ok(())
 }
 
+const TERMINAL_JOB_STATUSES: &[&str] = &["done", "partial", "failed", "cancelled"];
+
+pub fn is_terminal_job_status(status: &str) -> bool {
+    TERMINAL_JOB_STATUSES.contains(&status)
+}
+
+pub fn delete_job(conn: &Connection, job_id: Uuid) -> Result<(), VaultError> {
+    let job = get_job(conn, job_id)?.ok_or(VaultError::NotFound)?;
+    if !is_terminal_job_status(&job.status) {
+        return Err(VaultError::InvalidLayout {
+            detail: format!("job {} is not terminal (status={})", job_id, job.status),
+        });
+    }
+    conn.execute(
+        "DELETE FROM job WHERE parent_job_id = ?1",
+        [job_id.to_string()],
+    )
+    .map_err(db_err)?;
+    conn.execute(
+        "DELETE FROM source_failure WHERE job_id = ?1",
+        [job_id.to_string()],
+    )
+    .map_err(db_err)?;
+    let changed = conn
+        .execute("DELETE FROM job WHERE id = ?1", [job_id.to_string()])
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err(VaultError::NotFound);
+    }
+    Ok(())
+}
+
+/// Remove successful terminal jobs older than `ttl_hours`.
+pub fn purge_terminal_jobs(conn: &Connection, ttl_hours: i64) -> Result<u32, VaultError> {
+    let cutoff = (Utc::now() - Duration::hours(ttl_hours)).to_rfc3339();
+    let changed = conn
+        .execute(
+            "DELETE FROM job
+             WHERE status IN ('done', 'cancelled')
+               AND created_at < ?1",
+            [cutoff],
+        )
+        .map_err(db_err)?;
+    Ok(changed as u32)
+}
+
+fn manifest_item_label(item: &archiveos_contract::ManifestItem) -> String {
+    if let Some(meta) = item.metadata.as_ref() {
+        if let Some(title) = meta.get("title").and_then(|v| v.as_str()) {
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+    }
+    if let Some(ytdlp) = item.metadata_by_provenance.get("yt-dlp") {
+        if let Some(title) = ytdlp.get("title").and_then(|v| v.as_str()) {
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+    }
+    item.source_ref
+        .as_ref()
+        .map(|r| r.external_id.clone())
+        .unwrap_or_else(|| item.path.clone())
+}
+
+const LIFECYCLE_ITEM_STATUSES: &[&str] = &["unavailable", "private", "region_locked", "dead"];
+
+fn is_lifecycle_item_status(status: &str) -> bool {
+    LIFECYCLE_ITEM_STATUSES.contains(&status)
+}
+
+fn manifest_item_step_status(status: &str) -> &'static str {
+    match status {
+        "complete" => "done",
+        "discovered" => "skipped",
+        s if is_lifecycle_item_status(s) => "unavailable",
+        "failed" => "failed",
+        _ => "failed",
+    }
+}
+
+pub fn resolve_manifest_job_status(manifest: &ImportManifest, explicit: Option<&str>) -> String {
+    if let Some(status) = explicit {
+        return match status {
+            "done" | "partial" | "failed" => status.to_string(),
+            _ => "done".to_string(),
+        };
+    }
+
+    let video_items: Vec<_> = manifest
+        .items
+        .iter()
+        .filter(|item| item.source_ref.as_ref().is_some_and(|r| r.kind == "video"))
+        .collect();
+    if video_items.is_empty() {
+        return "done".to_string();
+    }
+
+    let complete = video_items
+        .iter()
+        .filter(|item| item.status == "complete")
+        .count();
+    let hard_failed = video_items
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.status.as_str(),
+                "complete" | "discovered"
+            ) && !is_lifecycle_item_status(&item.status)
+        })
+        .count();
+    let lifecycle = video_items
+        .iter()
+        .filter(|item| is_lifecycle_item_status(&item.status))
+        .count();
+
+    if hard_failed > 0 && complete > 0 {
+        "partial".to_string()
+    } else if hard_failed > 0 {
+        "failed".to_string()
+    } else if lifecycle > 0 {
+        "partial".to_string()
+    } else {
+        "done".to_string()
+    }
+}
+
+fn finish_progress_summary_label(video_items: &[&ManifestItem]) -> Option<String> {
+    if video_items.is_empty() {
+        return None;
+    }
+    let complete = video_items
+        .iter()
+        .filter(|item| item.status == "complete")
+        .count();
+    let discovered = video_items
+        .iter()
+        .filter(|item| item.status == "discovered")
+        .count();
+    let lifecycle = video_items
+        .iter()
+        .filter(|item| is_lifecycle_item_status(&item.status))
+        .count();
+    let hard_failed = video_items
+        .iter()
+        .filter(|item| {
+            !matches!(
+                item.status.as_str(),
+                "complete" | "discovered"
+            ) && !is_lifecycle_item_status(&item.status)
+        })
+        .count();
+
+    let mut parts = Vec::new();
+    if complete > 0 {
+        parts.push(format!("{complete} OK"));
+    }
+    if discovered > 0 {
+        parts.push(format!("{discovered} skipped"));
+    }
+    if lifecycle > 0 {
+        parts.push(format!("{lifecycle} unavailable"));
+    }
+    if hard_failed > 0 {
+        parts.push(format!("{hard_failed} failed"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+fn failure_message_for_item<'a>(
+    failures: &'a [SourceFailure],
+    external_id: &str,
+    kind: &str,
+) -> Option<&'a str> {
+    failures
+        .iter()
+        .find(|f| f.external_id == external_id && f.kind == kind)
+        .map(|f| f.message.as_str())
+}
+
+pub fn build_finish_progress(manifest: &ImportManifest, failures: &[SourceFailure]) -> JobProgress {
+    use std::collections::HashMap;
+
+    let mut steps_by_id: HashMap<String, JobProgressStep> = HashMap::new();
+    for item in &manifest.items {
+        let Some(source_ref) = item.source_ref.as_ref() else {
+            continue;
+        };
+        if !matches!(source_ref.kind.as_str(), "video" | "thumbnail" | "avatar") {
+            continue;
+        }
+        let label = match source_ref.kind.as_str() {
+            "thumbnail" => format!("Thumbnail: {}", manifest_item_label(item)),
+            "avatar" => format!("Avatar: {}", manifest_item_label(item)),
+            _ => manifest_item_label(item),
+        };
+        let message = failure_message_for_item(failures, &source_ref.external_id, &source_ref.kind)
+            .map(str::to_string);
+        steps_by_id.insert(
+            source_ref.external_id.clone(),
+            JobProgressStep {
+                id: source_ref.external_id.clone(),
+                label,
+                status: manifest_item_step_status(&item.status).to_string(),
+                percent: None,
+                message,
+            },
+        );
+    }
+
+    if !manifest.membership.is_empty() {
+        for member in &manifest.membership {
+            if member.kind != "video" {
+                continue;
+            }
+            if steps_by_id.contains_key(&member.external_id) {
+                continue;
+            }
+            let message = failure_message_for_item(failures, &member.external_id, "video")
+                .map(str::to_string);
+            steps_by_id.insert(
+                member.external_id.clone(),
+                JobProgressStep {
+                    id: member.external_id.clone(),
+                    label: member.external_id.clone(),
+                    status: "skipped".to_string(),
+                    percent: None,
+                    message,
+                },
+            );
+        }
+    }
+
+    if steps_by_id.is_empty() {
+        for failure in failures {
+            let label = match failure.kind.as_str() {
+                "thumbnail" => format!("Thumbnail {}", failure.external_id),
+                "avatar" => format!("Avatar {}", failure.external_id),
+                "video" => failure.external_id.clone(),
+                _ => format!("{}/{}", failure.kind, failure.external_id),
+            };
+            steps_by_id.insert(
+                failure.external_id.clone(),
+                JobProgressStep {
+                    id: failure.external_id.clone(),
+                    label,
+                    status: "failed".to_string(),
+                    percent: None,
+                    message: Some(failure.message.clone()),
+                },
+            );
+        }
+    }
+
+    let steps: Vec<JobProgressStep> = if manifest.membership.is_empty() {
+        let mut ordered = Vec::new();
+        for item in &manifest.items {
+            let Some(source_ref) = item.source_ref.as_ref() else {
+                continue;
+            };
+            if let Some(step) = steps_by_id.remove(&source_ref.external_id) {
+                ordered.push(step);
+            }
+        }
+        ordered.extend(steps_by_id.into_values());
+        ordered
+    } else {
+        let mut ordered = Vec::new();
+        for member in &manifest.membership {
+            if member.kind != "video" {
+                continue;
+            }
+            if let Some(step) = steps_by_id.remove(&member.external_id) {
+                ordered.push(step);
+            }
+        }
+        ordered.extend(steps_by_id.into_values());
+        ordered
+    };
+
+    let video_items: Vec<_> = manifest
+        .items
+        .iter()
+        .filter(|i| i.source_ref.as_ref().is_some_and(|r| r.kind == "video"))
+        .collect();
+    let complete = video_items
+        .iter()
+        .filter(|i| i.status == "complete")
+        .count();
+    let total = if !manifest.membership.is_empty() {
+        manifest
+            .membership
+            .iter()
+            .filter(|m| m.kind == "video")
+            .count()
+    } else {
+        video_items.len()
+    };
+    let label = finish_progress_summary_label(&video_items).or_else(|| {
+        if !steps.is_empty() {
+            Some(format!(
+                "{} issue(s)",
+                steps.iter().filter(|s| s.status == "failed").count()
+            ))
+        } else {
+            None
+        }
+    });
+
+    JobProgress {
+        phase: "finished".into(),
+        current: Some(complete as i32),
+        total: if total > 0 {
+            Some(total as i32)
+        } else {
+            Some(steps.len() as i32)
+        },
+        label,
+        percent: None,
+        steps,
+    }
+}
+
 fn job_returning_columns() -> &'static str {
     "id, type, target_vault, input, status, lease_until, attempts, created_at, progress_json, parent_job_id"
 }
@@ -473,6 +804,7 @@ mod tests {
                 label: "Video 1".into(),
                 status: "done".into(),
                 percent: None,
+                message: None,
             }],
         };
         assert!(!heartbeat_job(conn, job.id, 600, Some(&progress)).unwrap());
@@ -597,5 +929,196 @@ mod tests {
         assert_eq!(count, 1);
         let updated = get_job(conn, job.id).unwrap().unwrap();
         assert_eq!(updated.status, "cancelled");
+    }
+
+    #[test]
+    fn delete_terminal_job_cascades_children() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let parent = create_job(conn, "yt-dlp", "test", "url").unwrap();
+        finish_job(conn, parent.id, "failed").unwrap();
+        let child = create_job_with_options(
+            conn,
+            CreateJobOptions {
+                job_type: "preview",
+                target_vault: "test",
+                input: "{}",
+                parent_job_id: Some(parent.id),
+            },
+        )
+        .unwrap();
+        finish_job(conn, child.id, "done").unwrap();
+
+        delete_job(conn, parent.id).unwrap();
+        assert!(get_job(conn, parent.id).unwrap().is_none());
+        assert!(get_job(conn, child.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_rejects_running_job() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let job = create_job(conn, "yt-dlp", "test", "url").unwrap();
+        claim_job(conn, 60, None).unwrap();
+        assert!(delete_job(conn, job.id).is_err());
+    }
+
+    #[test]
+    fn purge_removes_old_done_jobs() {
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+
+        let job = create_job(conn, "yt-dlp", "test", "url").unwrap();
+        finish_job(conn, job.id, "done").unwrap();
+        let old = (Utc::now() - Duration::hours(48)).to_rfc3339();
+        conn.execute(
+            "UPDATE job SET created_at = ?1 WHERE id = ?2",
+            params![old, job.id.to_string()],
+        )
+        .unwrap();
+
+        let purged = purge_terminal_jobs(conn, 24).unwrap();
+        assert_eq!(purged, 1);
+        assert!(get_job(conn, job.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn build_finish_progress_from_manifest_and_failures() {
+        use archiveos_contract::{
+            ImportManifest, ImportStrategy, ManifestItem, ManifestSourceRef,
+        };
+        use crate::failures::{RecordFailureInput, record_failure};
+
+        let dir = tempdir().unwrap();
+        let vault = Vault::init(dir.path()).unwrap();
+        let conn = vault.connection();
+        let job = create_job(conn, "yt-dlp", "test", "url").unwrap();
+
+        record_failure(
+            conn,
+            &RecordFailureInput {
+                job_id: Some(job.id),
+                source: "youtube".into(),
+                kind: "video".into(),
+                external_id: "vid2".into(),
+                url: None,
+                stage: "download".into(),
+                error_kind: "unavailable".into(),
+                message: "video unavailable".into(),
+                retryable: false,
+            },
+        )
+        .unwrap();
+
+        let manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            source_identity: Some("youtube".into()),
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![],
+            items: vec![
+                ManifestItem {
+                    path: "files/vid1.mp4".into(),
+                    sha256: None,
+                    status: "complete".into(),
+                    source_ref: Some(ManifestSourceRef {
+                        source: "youtube".into(),
+                        kind: "video".into(),
+                        external_id: "vid1".into(),
+                        url: None,
+                    }),
+                    metadata: Some(serde_json::json!({ "title": "Good video" })),
+                    metadata_by_provenance: Default::default(),
+                    assets: vec![],
+                },
+                ManifestItem {
+                    path: "".into(),
+                    sha256: None,
+                    status: "unavailable".into(),
+                    source_ref: Some(ManifestSourceRef {
+                        source: "youtube".into(),
+                        kind: "video".into(),
+                        external_id: "vid2".into(),
+                        url: None,
+                    }),
+                    metadata: Some(serde_json::json!({ "title": "Gone video" })),
+                    metadata_by_provenance: Default::default(),
+                    assets: vec![],
+                },
+            ],
+            membership: vec![],
+            relations: vec![],
+        };
+
+        let failures = crate::failures::list_failures_for_job(conn, job.id).unwrap();
+        let progress = build_finish_progress(&manifest, &failures);
+        assert_eq!(progress.phase, "finished");
+        assert_eq!(progress.steps.len(), 2);
+        assert_eq!(progress.steps[0].status, "done");
+        assert_eq!(progress.steps[1].status, "unavailable");
+        assert_eq!(
+            progress.steps[1].message.as_deref(),
+            Some("video unavailable")
+        );
+        assert_eq!(progress.label.as_deref(), Some("1 OK, 1 unavailable"));
+    }
+
+    #[test]
+    fn resolve_manifest_job_status_treats_lifecycle_as_done() {
+        use archiveos_contract::{
+            ImportManifest, ImportStrategy, ManifestItem, ManifestSourceRef,
+        };
+
+        let manifest = ImportManifest {
+            source: "yt-dlp".into(),
+            source_identity: Some("youtube".into()),
+            vault: "test".into(),
+            strategy: ImportStrategy::Managed,
+            collection: None,
+            channels: vec![],
+            items: vec![
+                ManifestItem {
+                    path: "".into(),
+                    sha256: None,
+                    status: "discovered".into(),
+                    source_ref: Some(ManifestSourceRef {
+                        source: "youtube".into(),
+                        kind: "video".into(),
+                        external_id: "vid1".into(),
+                        url: None,
+                    }),
+                    metadata: None,
+                    metadata_by_provenance: Default::default(),
+                    assets: vec![],
+                },
+                ManifestItem {
+                    path: "".into(),
+                    sha256: None,
+                    status: "unavailable".into(),
+                    source_ref: Some(ManifestSourceRef {
+                        source: "youtube".into(),
+                        kind: "video".into(),
+                        external_id: "vid2".into(),
+                        url: None,
+                    }),
+                    metadata: None,
+                    metadata_by_provenance: Default::default(),
+                    assets: vec![],
+                },
+            ],
+            membership: vec![],
+            relations: vec![],
+        };
+
+        assert_eq!(
+            resolve_manifest_job_status(&manifest, None),
+            "partial".to_string()
+        );
     }
 }

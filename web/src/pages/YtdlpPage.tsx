@@ -217,7 +217,7 @@ export default function YtdlpPage() {
 
       <p className="card-meta">
         Import errors appear on the{" "}
-        <Link to="/jobs">Jobs</Link> page under the Failures tab.
+        <Link to="/jobs">Jobs</Link> page under the Problems tab.
       </p>
     </section>
   );
